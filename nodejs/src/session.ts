@@ -31,6 +31,7 @@ import type {
     SessionManagementPolicy,
 } from "./generated/rpc.js";
 import { type Canvas, CanvasError } from "./canvas.js";
+import { SessionDecisions, type SessionDecisionsApi } from "./decisions.js";
 import type { OpenCanvasInstance } from "./generated/rpc.js";
 import { getTraceContext } from "./telemetry.js";
 import { isResponseSchema, toJsonSchema } from "./schema.js";
@@ -744,6 +745,32 @@ export class CopilotSession {
         }
         return this._rpc;
     }
+
+    /**
+     * Calls OpenAI's Decisions API directly against the session's provider endpoint.
+     * Requires the runtime to run with `COPILOT_ALLOW_GET_PROVIDER_ENDPOINT=true`.
+     *
+     * @experimental Part of the experimental Decisions API surface and may change or be removed.
+     *
+     * @example
+     * ```typescript
+     * const result = await session.decisions.create({
+     *   model: "gpt-6-luna",
+     *   input: "The customer asked for a refund.",
+     *   questions: [{ type: "predicate", instructions: "Is this a billing issue?" }],
+     * });
+     * ```
+     */
+    get decisions(): SessionDecisionsApi {
+        if (!this._decisions) {
+            this._decisions = new SessionDecisions((params) =>
+                this.rpc.provider.getEndpoint(params)
+            );
+        }
+        return this._decisions;
+    }
+
+    private _decisions?: SessionDecisions;
 
     /** @internal */
     private get internalRpc(): ReturnType<typeof createInternalSessionRpc> {
