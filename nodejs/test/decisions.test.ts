@@ -486,7 +486,12 @@ describe("decisions vectors", () => {
             it(v.name, async () => {
                 const payload =
                     (v.bodyPrefix ? String(v.bodyPrefix.char).repeat(v.bodyPrefix.count) : "") +
-                    v.body;
+                    (v.bodyRepeat
+                        ? v.body.replaceAll(
+                              "{{repeat}}",
+                              String(v.bodyRepeat.text).repeat(v.bodyRepeat.count)
+                          )
+                        : v.body);
                 const { fetch } = fakeFetch([
                     () =>
                         new Response(payload, {

@@ -616,7 +616,11 @@ class TestVectors:
     @pytest.mark.parametrize("vector", VECTORS["redaction"], ids=_ids("redaction"))
     async def test_redaction(self, vector: dict[str, Any]):
         prefix = vector.get("bodyPrefix")
-        payload = (str(prefix["char"]) * prefix["count"] if prefix else "") + vector["body"]
+        body = vector["body"]
+        repeat = vector.get("bodyRepeat")
+        if repeat:
+            body = body.replace("{{repeat}}", str(repeat["text"]) * repeat["count"])
+        payload = (str(prefix["char"]) * prefix["count"] if prefix else "") + body
         http = FakeHttp([text_response(vector["status"], payload, {"x-request-id": "req_123"})])
         error = await capture_error(
             decisions_with([vector["endpoint"]]).create(MINIMAL_REQUEST, http_client=http.client)

@@ -63,8 +63,9 @@ public final class DecisionsOptions {
      * a proxy or TLS. The client must be built with
      * {@link HttpClient.Redirect#NEVER}: redirects are never followed because they
      * could forward credentials to another origin. A client with any other redirect
-     * policy is rejected with {@link IllegalArgumentException} before any I/O. When
-     * {@code null}, a shared SDK client is used.
+     * policy is rejected with {@link IllegalArgumentException}, reported through
+     * the returned future, before the request is sent. When {@code null}, a shared
+     * SDK client is used.
      *
      * @param httpClient
      *            the client

@@ -100,7 +100,8 @@ type DecisionsNetworkCause struct {
 	// Name is the Go type of the underlying error, for example "*net.OpError".
 	Name    string
 	Message string
-	// Code is the numeric system error code, when one was present.
+	// Code is the symbolic system error code (for example "ECONNRESET") when a
+	// recognized one was present; it is empty otherwise.
 	Code string
 }
 
@@ -266,11 +267,39 @@ func sanitizeDecisionsCause(err error, secrets []string) *DecisionsNetworkCause 
 		Name:    fmt.Sprintf("%T", inner),
 		Message: redactDecisionsText(inner.Error(), secrets),
 	}
-	var errno syscall.Errno
-	if errors.As(err, &errno) {
-		cause.Code = strconv.FormatUint(uint64(errno), 10)
-	}
+	cause.Code = decisionsErrnoCode(err)
 	return cause
+}
+
+var decisionsErrnoNames = []struct {
+	errno syscall.Errno
+	name  string
+}{
+	{syscall.ECONNRESET, "ECONNRESET"},
+	{syscall.ECONNREFUSED, "ECONNREFUSED"},
+	{syscall.ETIMEDOUT, "ETIMEDOUT"},
+	{syscall.EPIPE, "EPIPE"},
+	{syscall.ECONNABORTED, "ECONNABORTED"},
+	{syscall.EHOSTUNREACH, "EHOSTUNREACH"},
+	{syscall.ENETUNREACH, "ENETUNREACH"},
+}
+
+func decisionsErrnoCode(err error) string {
+	var errno syscall.Errno
+	if !errors.As(err, &errno) {
+		return ""
+	}
+	for _, entry := range decisionsErrnoNames {
+		if errno == entry.errno {
+			return entry.name
+		}
+	}
+	for _, entry := range decisionsPlatformErrnoNames {
+		if errno == entry.errno {
+			return entry.name
+		}
+	}
+	return ""
 }
 
 func decisionsHTTPError(ctx context.Context, resp *http.Response, secrets []string) error {
@@ -289,9 +318,8 @@ func decisionsHTTPError(ctx context.Context, resp *http.Response, secrets []stri
 	}
 	text := redactDecisionsText(decodeDecisionsLossy(raw), secrets)
 	truncated := exceeded || len(raw) > decisionsMaxErrorBodyBytes
-	if truncated {
-		text = truncateUTF8(text, decisionsMaxErrorBodyBytes)
-	}
+	// Cut even when not truncated: replacing short secrets with "[REDACTED]" can grow the text.
+	text = truncateUTF8(text, decisionsMaxErrorBodyBytes)
 
 	result := &DecisionsError{
 		Kind:          DecisionsErrorKindHTTP,
@@ -414,7 +442,7 @@ func buildDecisionsURL(endpointType rpc.ProviderEndpointType, baseURL string) (s
 	if (scheme != "http" && scheme != "https") || u.Host == "" {
 		return "", decisionsInvalidEndpoint("The provider endpoint base URL must use http or https.")
 	}
-	if u.User != nil {
+	if u.User != nil || strings.Contains(rawDecisionsAuthority(baseURL), "@") {
 		return "", decisionsInvalidEndpoint("The provider endpoint base URL must not contain credentials.")
 	}
 	host := strings.ToLower(u.Hostname())
@@ -434,6 +462,17 @@ func buildDecisionsURL(endpointType rpc.ProviderEndpointType, baseURL string) (s
 		result += "?" + u.RawQuery
 	}
 	return result, nil
+}
+
+func rawDecisionsAuthority(rawURL string) string {
+	_, rest, ok := strings.Cut(rawURL, "//")
+	if !ok {
+		return ""
+	}
+	if end := strings.IndexAny(rest, "/?#"); end >= 0 {
+		rest = rest[:end]
+	}
+	return rest
 }
 
 func checkDecisionsHeader(name, value string) (string, error) {

@@ -845,7 +845,13 @@ async fn vectors_redaction() {
             let count = usize::try_from(prefix["count"].as_u64().unwrap()).unwrap();
             payload.push_str(&c.repeat(count));
         }
-        payload.push_str(v["body"].as_str().unwrap());
+        let mut body = v["body"].as_str().unwrap().to_owned();
+        if let Some(repeat) = v.get("bodyRepeat") {
+            let text = repeat["text"].as_str().unwrap();
+            let count = usize::try_from(repeat["count"].as_u64().unwrap()).unwrap();
+            body = body.replace("{{repeat}}", &text.repeat(count));
+        }
+        payload.push_str(&body);
 
         let resolver = Resolver::endpoints(vec![endpoint(&v["endpoint"])]);
         let transport = FakeTransport::new(vec![respond_with_id(status, payload, "req_123")]);

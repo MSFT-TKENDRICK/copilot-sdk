@@ -1078,6 +1078,20 @@ fn transport_name(t: &ProviderEndpointTransport) -> &'static str {
     }
 }
 
+/// Whether the raw authority of `base_url` contains `@`; the url crate drops empty userinfo.
+fn raw_authority_has_userinfo(base_url: &str) -> bool {
+    let trimmed = base_url.trim();
+    let after_scheme = match trimmed.find(':') {
+        Some(i) => trimmed[i + 1..].trim_start_matches(['/', '\\']),
+        None => trimmed,
+    };
+    after_scheme
+        .split(['/', '\\', '?', '#'])
+        .next()
+        .unwrap_or_default()
+        .contains('@')
+}
+
 /// Builds the Decisions URL from the endpoint's base URL.
 fn build_url(
     endpoint_type: &ProviderEndpointType,
@@ -1092,7 +1106,10 @@ fn build_url(
             "The provider endpoint base URL must use http or https.",
         ));
     }
-    if !url.username().is_empty() || url.password().is_some_and(|p| !p.is_empty()) {
+    if !url.username().is_empty()
+        || url.password().is_some_and(|p| !p.is_empty())
+        || raw_authority_has_userinfo(base_url)
+    {
         return Err(invalid_endpoint(
             "The provider endpoint base URL must not contain credentials.",
         ));
@@ -1772,11 +1789,8 @@ async fn http_error(
     let raw = decode_utf8(&bytes);
     let redacted = redactor.redact(&raw);
     let truncated = exceeded || bytes.len() > MAX_ERROR_BODY_BYTES;
-    let body = if truncated {
-        truncate_utf8(redacted, MAX_ERROR_BODY_BYTES)
-    } else {
-        redacted
-    };
+    // Cut even when not truncated: replacing short secrets with "[REDACTED]" can grow the text.
+    let body = truncate_utf8(redacted, MAX_ERROR_BODY_BYTES);
 
     let mut error_type = None;
     let mut error_code = None;

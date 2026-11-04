@@ -6,6 +6,7 @@ import (
 	"io"
 	"net/http"
 	"strings"
+	"syscall"
 	"testing"
 
 	"github.com/github/copilot-sdk/go/rpc"
@@ -185,5 +186,34 @@ func TestDecisionsRejectsNonIntegralUsage(t *testing.T) {
 	var de *DecisionsError
 	if !errors.As(err, &de) || de.Kind != DecisionsErrorKindInvalidResponse {
 		t.Fatalf("err = %v", err)
+	}
+}
+
+func TestDecisionsErrnoCode(t *testing.T) {
+	cases := []struct {
+		err  error
+		want string
+	}{
+		{syscall.ECONNRESET, "ECONNRESET"},
+		{syscall.ECONNREFUSED, "ECONNREFUSED"},
+		{syscall.ETIMEDOUT, "ETIMEDOUT"},
+		{syscall.EPIPE, "EPIPE"},
+		{syscall.ECONNABORTED, "ECONNABORTED"},
+		{syscall.EHOSTUNREACH, "EHOSTUNREACH"},
+		{syscall.ENETUNREACH, "ENETUNREACH"},
+		{errors.Join(errors.New("wrapped"), syscall.ECONNREFUSED), "ECONNREFUSED"},
+		{syscall.Errno(1), ""},
+		{errors.New("plain"), ""},
+	}
+	for _, entry := range decisionsPlatformErrnoNames {
+		cases = append(cases, struct {
+			err  error
+			want string
+		}{entry.errno, entry.name})
+	}
+	for _, tc := range cases {
+		if got := decisionsErrnoCode(tc.err); got != tc.want {
+			t.Errorf("decisionsErrnoCode(%v) = %q, want %q", tc.err, got, tc.want)
+		}
 	}
 }

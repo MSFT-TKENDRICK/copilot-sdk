@@ -733,9 +733,14 @@ class DecisionsTest {
     @TestFactory
     Stream<DynamicTest> redactionVectors() {
         return group("redaction").map(v -> DynamicTest.dynamicTest(v.get("name").asText(), () -> {
+            String body = v.get("body").asText();
+            if (v.has("bodyRepeat")) {
+                body = body.replace("{{repeat}}",
+                        v.get("bodyRepeat").get("text").asText().repeat(v.get("bodyRepeat").get("count").asInt()));
+            }
             String payload = (v.has("bodyPrefix")
                     ? v.get("bodyPrefix").get("char").asText().repeat(v.get("bodyPrefix").get("count").asInt())
-                    : "") + v.get("body").asText();
+                    : "") + body;
             int status = v.get("status").asInt();
             FakeClient client = client(respond(status, payload, Map.of("x-request-id", "req_123")));
             DecisionsException error = decisionsFailure(
@@ -843,7 +848,7 @@ class DecisionsTest {
     }
 
     @Test
-    void redactionGrowthIsStillCappedAt64KiB() throws Exception {
+    void redactionGrowthIsCappedAt64KiBWithoutTruncation() throws Exception {
         int cap = SessionDecisions.MAX_ERROR_BODY_BYTES;
         String secret = "sk-test1";
         String body = secret + "x".repeat(cap - secret.length());
@@ -852,7 +857,7 @@ class DecisionsTest {
                 decisionsWith(openai(secret)).create(minimalRequest(), with(client)));
         assertTrue(error.getBody().startsWith(DecisionsRedaction.REDACTED));
         assertTrue(error.getBody().getBytes(StandardCharsets.UTF_8).length <= cap);
-        assertEquals(Boolean.TRUE, error.getBodyTruncated());
+        assertEquals(Boolean.FALSE, error.getBodyTruncated());
         assertFalse(error.getBody().contains(secret));
     }
 
@@ -957,14 +962,26 @@ class DecisionsTest {
     }
 
     @Test
-    void rejectsClientsThatFollowRedirects() {
+    void rejectsClientsThatFollowRedirectsThroughTheFutureBeforeSending() throws Exception {
         List<String> seen = Collections.synchronizedList(new ArrayList<>());
         FakeClient client = new FakeClient(List.of(respond(200, OK_BODY)), HttpClient.Redirect.NORMAL,
                 Collections.synchronizedList(new ArrayList<>()));
-        IllegalArgumentException error = assertThrows(IllegalArgumentException.class,
-                () -> decisionsWith(List.of(OPENAI), seen).create(minimalRequest(), with(client)));
+        CompletableFuture<DecisionsResult> future = decisionsWith(List.of(OPENAI), seen).create(minimalRequest(),
+                with(client));
+        IllegalArgumentException error = assertInstanceOf(IllegalArgumentException.class, failure(future));
         assertTrue(error.getMessage().contains("Redirect.NEVER"));
-        assertEquals(0, seen.size());
+        assertEquals(1, seen.size());
+        assertEquals(0, client.calls.size());
+    }
+
+    @Test
+    void endpointValidationPrecedesRedirectPolicyCheck() throws Exception {
+        FakeClient client = new FakeClient(List.of(respond(200, OK_BODY)), HttpClient.Redirect.NORMAL,
+                Collections.synchronizedList(new ArrayList<>()));
+        SessionProviderGetEndpointResult bad = endpoint(
+                json("{\"type\":\"openai\",\"baseUrl\":\"ftp://api.openai.com/v1\",\"headers\":{}}"));
+        DecisionsException error = decisionsFailure(decisionsWith(bad).create(minimalRequest(), with(client)));
+        assertEquals(DecisionsErrorKind.INVALID_ENDPOINT, error.getKind());
         assertEquals(0, client.calls.size());
     }
 

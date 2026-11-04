@@ -113,8 +113,8 @@ final class DecisionsEndpointPlanner {
         if (!scheme.equals("http") && !scheme.equals("https")) {
             throw invalidEndpoint("The provider endpoint base URL must use http or https.");
         }
-        String userInfo = uri.getRawUserInfo();
-        if (userInfo != null && !userInfo.isEmpty() && !userInfo.equals(":")) {
+        String authority = uri.getRawAuthority();
+        if (uri.getRawUserInfo() != null || (authority != null && authority.indexOf('@') >= 0)) {
             throw invalidEndpoint("The provider endpoint base URL must not contain credentials.");
         }
         StringBuilder out = new StringBuilder();

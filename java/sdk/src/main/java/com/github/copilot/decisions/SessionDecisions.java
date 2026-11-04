@@ -102,10 +102,11 @@ public final class SessionDecisions {
      * @param options
      *            per-call options, or {@code null}
      * @return a future completing with the result, or exceptionally with a
-     *         {@link DecisionsException}
+     *         {@link DecisionsException}, or with an
+     *         {@link IllegalArgumentException} if the supplied {@link HttpClient}
+     *         follows redirects
      * @throws IllegalArgumentException
-     *             if {@code request.model} is missing, or the supplied
-     *             {@link HttpClient} follows redirects
+     *             if {@code request.model} is missing
      */
     public CompletableFuture<DecisionsResult> create(DecisionsRequest request, DecisionsOptions options) {
         Objects.requireNonNull(request, "request");
@@ -116,9 +117,6 @@ public final class SessionDecisions {
         HttpClient client = opts.getHttpClient();
         if (client == null) {
             client = DefaultClient.INSTANCE;
-        } else if (client.followRedirects() != HttpClient.Redirect.NEVER) {
-            throw new IllegalArgumentException(
-                    "DecisionsOptions.httpClient must use HttpClient.Redirect.NEVER; the Decisions API never follows redirects.");
         }
         return new Call(request, opts, client).start();
     }
@@ -216,22 +214,18 @@ public final class SessionDecisions {
         String raw = new String(read.bytes(), StandardCharsets.UTF_8);
         String redacted = DecisionsRedaction.redact(raw, secrets);
         byte[] encoded = redacted.getBytes(StandardCharsets.UTF_8);
-        // Redaction or lossy decoding can grow the text, so the cap is enforced on the
-        // redacted encoding as well as the raw read.
-        boolean truncated = read.exceeded() || read.bytes().length > MAX_ERROR_BODY_BYTES
-                || encoded.length > MAX_ERROR_BODY_BYTES;
-        if (!truncated) {
-            return new ErrorBody(raw, redacted, false);
+        boolean truncated = read.exceeded() || read.bytes().length > MAX_ERROR_BODY_BYTES;
+        if (encoded.length <= MAX_ERROR_BODY_BYTES) {
+            return new ErrorBody(raw, redacted, truncated);
         }
-        int cut = Math.min(encoded.length, MAX_ERROR_BODY_BYTES);
-        if (cut < encoded.length) {
-            // Back off to a UTF-8 boundary: a split trailing character is dropped, never
-            // emitted as U+FFFD.
-            while (cut > 0 && (encoded[cut] & 0xC0) == 0x80) {
-                cut--;
-            }
+        // Cut even when not truncated: redaction or lossy decoding can grow the text.
+        // Back off to a UTF-8 boundary: a split trailing character is dropped, never
+        // emitted as U+FFFD.
+        int cut = MAX_ERROR_BODY_BYTES;
+        while (cut > 0 && (encoded[cut] & 0xC0) == 0x80) {
+            cut--;
         }
-        return new ErrorBody(raw, new String(encoded, 0, cut, StandardCharsets.UTF_8), true);
+        return new ErrorBody(raw, new String(encoded, 0, cut, StandardCharsets.UTF_8), truncated);
     }
 
     private static String stringField(JsonNode value) {
@@ -395,6 +389,10 @@ public final class SessionDecisions {
                     body = MAPPER.writeValueAsBytes(DecisionsWire.serialize(request));
                 } catch (JsonProcessingException e) {
                     throw new IllegalArgumentException("DecisionsRequest could not be serialized.", e);
+                }
+                if (client.followRedirects() != HttpClient.Redirect.NEVER) {
+                    throw new IllegalArgumentException(
+                            "DecisionsOptions.httpClient must use HttpClient.Redirect.NEVER; the Decisions API never follows redirects.");
                 }
                 return send(plan, body).thenCompose(response -> {
                     int status = response.statusCode();

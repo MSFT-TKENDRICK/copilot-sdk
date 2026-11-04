@@ -566,7 +566,7 @@ def _build_decisions_url(endpoint: ProviderEndpoint) -> str:
         raise _invalid_endpoint("The provider endpoint base URL must use http or https.")
     if not hostname:
         raise _invalid_endpoint(invalid)
-    if parts.username is not None or parts.password is not None:
+    if "@" in parts.netloc or parts.username is not None or parts.password is not None:
         raise _invalid_endpoint("The provider endpoint base URL must not contain credentials.")
     host = f"[{hostname}]" if ":" in hostname else hostname
     if port is not None and port != _DEFAULT_PORTS[scheme]:
@@ -1095,9 +1095,8 @@ async def _read_redacted_error_body(
     raw = _decode_utf8(data)
     redacted = _redact_secrets(raw, secrets)
     truncated = exceeded or len(data) > MAX_ERROR_BODY_BYTES
-    if not truncated:
-        return raw, redacted, truncated
-    # Drop a code point split by the cut so the body never exceeds the byte cap.
+    # Always cap after redaction: replacing short secrets with "[REDACTED]" can grow the
+    # text past the cap even when the raw body fit. Drop a code point split by the cut.
     body = redacted.encode("utf-8", "surrogatepass")[:MAX_ERROR_BODY_BYTES]
     return raw, body.decode("utf-8", errors="ignore"), truncated
 

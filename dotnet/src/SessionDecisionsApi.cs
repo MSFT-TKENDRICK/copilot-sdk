@@ -38,14 +38,16 @@ internal sealed class SessionDecisionsApi(CopilotSession session) : ISessionDeci
 
         options ??= s_defaultOptions;
         var handler = options.Handler;
-        if (handler is not null)
-        {
-            DecisionsHttp.EnsureNoAutoRedirect(options);
-        }
+        cancellationToken.ThrowIfCancellationRequested();
 
         var model = request.Model;
         var plan = DecisionsPlanner.Plan(await ResolveAsync(options, cancellationToken).ConfigureAwait(false), model);
         var body = DecisionsWire.SerializeRequest(request);
+
+        if (handler is not null)
+        {
+            DecisionsHttp.EnsureNoAutoRedirect(options);
+        }
 
         var client = handler is null ? DecisionsHttp.SharedClient : DecisionsHttp.CreateClient(handler);
         try
@@ -229,6 +231,7 @@ internal sealed class DecisionsAttemptPlan(string url, IReadOnlyList<KeyValuePai
 internal static class DecisionsPlanner
 {
     private const int MinSecretLength = 8;
+    private static readonly char[] s_authorityTerminators = ['/', '?', '#', '\\'];
 
     public static DecisionsAttemptPlan Plan(ProviderEndpoint endpoint, string model)
     {
@@ -296,7 +299,7 @@ internal static class DecisionsPlanner
             throw InvalidEndpoint("The provider endpoint base URL must use http or https.");
         }
 
-        if (!string.IsNullOrEmpty(uri.UserInfo))
+        if (!string.IsNullOrEmpty(uri.UserInfo) || RawAuthorityHasUserInfo(baseUrl!))
         {
             throw InvalidEndpoint("The provider endpoint base URL must not contain credentials.");
         }
@@ -312,6 +315,20 @@ internal static class DecisionsPlanner
         }
 
         return uri.GetComponents(UriComponents.SchemeAndServer, UriFormat.UriEscaped) + basePath + suffix + query;
+    }
+
+    private static bool RawAuthorityHasUserInfo(string url)
+    {
+        var start = url.IndexOf("://", StringComparison.Ordinal);
+        if (start < 0)
+        {
+            return false;
+        }
+
+        start += 3;
+        var end = url.IndexOfAny(s_authorityTerminators, start);
+        var at = url.IndexOf('@', start);
+        return at >= 0 && (end < 0 || at < end);
     }
 
     private static bool IsTokenChar(char c) =>
@@ -968,9 +985,10 @@ internal static class DecisionsHttp
         var raw = DecisionsText.DecodeUtf8(bytes, bytes.Length);
         var body = DecisionsText.Redact(raw, secrets);
         var truncated = exceeded || bytes.Length > SessionDecisionsApi.MaxErrorBodyBytes;
-        if (truncated)
+        // Cut even when not truncated: replacing short secrets with "[REDACTED]" can grow the text.
+        var encoded = DecisionsText.EncodeUtf8(body);
+        if (encoded.Length > SessionDecisionsApi.MaxErrorBodyBytes)
         {
-            var encoded = DecisionsText.EncodeUtf8(body);
             body = DecisionsText.DecodeUtf8(encoded, DecisionsText.Utf8BoundaryCut(encoded, SessionDecisionsApi.MaxErrorBodyBytes));
         }
 

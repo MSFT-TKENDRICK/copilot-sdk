@@ -1,5 +1,5 @@
 {
-  "$comment": "Normative behavior vectors for session.decisions. Endpoints use the ProviderEndpoint wire shape. Header expectations use lowercase names and list the COMPLETE outbound header set. All six SDK test suites must pass every vector. Redaction vectors: when `bodyPrefix` is present, the response body is `char` repeated `count` times followed by `body`; `mustNotContain` applies to message, body, and all error fields. When `bodyTruncated` is present it must match. `maxBodyBytes`, when present, bounds the UTF-8 byte length of the returned error body. Secret minimum length (8) is measured in Unicode scalar values after SP/HTAB trimming; `redactionLength` vectors use the value as an apiKey and check whether it is redacted from an error body that echoes it. Hex digits in \\uXXXX and %XX escapes match case-insensitively; `+` is accepted for space.",
+  "$comment": "Normative behavior vectors for session.decisions. Endpoints use the ProviderEndpoint wire shape. Header expectations use lowercase names and list the COMPLETE outbound header set. All six SDK test suites must pass every vector. Redaction vectors: when `bodyPrefix` is present, the response body is `char` repeated `count` times followed by `body`; `mustNotContain` applies to message, body, and all error fields. When `bodyTruncated` is present it must match; it is true only when the RAW body exceeded 64 KiB (or the stream overflowed), never merely because redaction expanded the text. When `bodyRepeat` is present, every `{{repeat}}` in `body` is replaced by `bodyRepeat.text` repeated `bodyRepeat.count` times. `maxBodyBytes`, when present, bounds the UTF-8 byte length of the returned error body (the redacted body is always cut to 64 KiB on a character boundary). Secret minimum length (8) is measured in Unicode scalar values after SP/HTAB trimming; `redactionLength` vectors use the value as an apiKey and check whether it is redacted from an error body that echoes it. Hex digits in \\uXXXX and %XX escapes match case-insensitively; `+` is accepted for space.",
   "url": [
     {
       "name": "openai_v1",
@@ -150,6 +150,24 @@
       "endpoint": {
         "type": "openai",
         "baseUrl": "https://user:secretpassword@api.openai.com/v1",
+        "headers": {}
+      },
+      "error": "invalidEndpoint"
+    },
+    {
+      "name": "empty_userinfo_rejected",
+      "endpoint": {
+        "type": "openai",
+        "baseUrl": "https://@api.openai.com/v1",
+        "headers": {}
+      },
+      "error": "invalidEndpoint"
+    },
+    {
+      "name": "empty_userinfo_with_colon_rejected",
+      "endpoint": {
+        "type": "openai",
+        "baseUrl": "https://:@api.openai.com/v1",
         "headers": {}
       },
       "error": "invalidEndpoint"
@@ -858,6 +876,28 @@
       ],
       "errorCode": null,
       "errorType": "invalid_request_error"
+    },
+    {
+      "name": "redaction_expansion_capped_without_truncation",
+      "endpoint": {
+        "type": "openai",
+        "baseUrl": "https://api.openai.com/v1",
+        "apiKey": "sk-abcd1",
+        "headers": {}
+      },
+      "status": 400,
+      "bodyRepeat": {
+        "text": "sk-abcd1 ",
+        "count": 7000
+      },
+      "body": "{\"error\": {\"type\": \"invalid_request_error\", \"code\": \"repeat\", \"message\": \"{{repeat}}\", \"param\": null}}",
+      "mustNotContain": [
+        "sk-abcd1"
+      ],
+      "errorCode": "repeat",
+      "errorType": "invalid_request_error",
+      "bodyTruncated": false,
+      "maxBodyBytes": 65536
     }
   ],
   "redactionLength": [

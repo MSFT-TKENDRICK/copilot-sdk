@@ -486,7 +486,10 @@ export function buildDecisionsUrl(endpoint: Pick<ProviderEndpoint, "type" | "bas
     if (url.protocol !== "http:" && url.protocol !== "https:") {
         throw invalidEndpoint("The provider endpoint base URL must use http or https.");
     }
-    if (url.username !== "" || url.password !== "") {
+    // WHATWG URL drops empty userinfo ("https://@host", "https://:@host"), so check the raw authority too.
+    const afterScheme = endpoint.baseUrl.trim().replace(/^[a-z][a-z0-9+.-]*:[/\\]*/i, "");
+    const authority = afterScheme.split(/[/\\?#]/, 1)[0] ?? "";
+    if (url.username !== "" || url.password !== "" || authority.includes("@")) {
         throw invalidEndpoint("The provider endpoint base URL must not contain credentials.");
     }
     const basePath = url.pathname.replace(/\/+$/, "");
@@ -1014,8 +1017,9 @@ async function readRedactedErrorBody(
     const raw = decodeUtf8(bytes);
     const redacted = redactSecrets(raw, secrets);
     const truncated = exceeded || bytes.byteLength > MAX_ERROR_BODY_BYTES;
-    if (!truncated) return { raw, body: redacted, truncated };
     const encoded = new TextEncoder().encode(redacted);
+    if (encoded.byteLength <= MAX_ERROR_BODY_BYTES) return { raw, body: redacted, truncated };
+    // Cut even when not truncated: replacing short secrets with "[REDACTED]" can grow the text.
     let cut = MAX_ERROR_BODY_BYTES;
     while (cut > 0 && (encoded[cut]! & 0xc0) === 0x80) cut--;
     return {

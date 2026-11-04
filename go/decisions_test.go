@@ -105,6 +105,10 @@ type decisionsVectors struct {
 			Char  string `json:"char"`
 			Count int    `json:"count"`
 		} `json:"bodyPrefix"`
+		BodyRepeat *struct {
+			Text  string `json:"text"`
+			Count int    `json:"count"`
+		} `json:"bodyRepeat"`
 		MustNotContain []string `json:"mustNotContain"`
 		ErrorCode      *string  `json:"errorCode"`
 		ErrorType      *string  `json:"errorType"`
@@ -686,8 +690,11 @@ func TestDecisionsVectorsRedaction(t *testing.T) {
 	for _, v := range loadDecisionsVectors(t).Redaction {
 		t.Run(v.Name, func(t *testing.T) {
 			payload := v.Body
+			if v.BodyRepeat != nil {
+				payload = strings.ReplaceAll(payload, "{{repeat}}", strings.Repeat(v.BodyRepeat.Text, v.BodyRepeat.Count))
+			}
 			if v.BodyPrefix != nil {
-				payload = strings.Repeat(v.BodyPrefix.Char, v.BodyPrefix.Count) + v.Body
+				payload = strings.Repeat(v.BodyPrefix.Char, v.BodyPrefix.Count) + payload
 			}
 			transport := newFakeDecisionsTransport(func(req *http.Request) (*http.Response, error) {
 				return &http.Response{
@@ -943,7 +950,7 @@ func TestDecisionsCreateWrapsTransportFailuresWithSanitizedCause(t *testing.T) {
 	if cause.Name != "*net.OpError" {
 		t.Errorf("cause name = %q", cause.Name)
 	}
-	if cause.Code != strconv.FormatUint(uint64(syscall.ECONNRESET), 10) {
+	if cause.Code != "ECONNRESET" {
 		t.Errorf("cause code = %q", cause.Code)
 	}
 	if strings.Contains(cause.Message, "sk-test-0001") || !strings.Contains(cause.Message, "[REDACTED]") {

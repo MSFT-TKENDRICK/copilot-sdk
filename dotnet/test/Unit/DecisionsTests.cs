@@ -402,11 +402,11 @@ public sealed class DecisionsTests
     [Fact]
     public void Vector_Groups_Are_All_Present()
     {
-        Assert.Equal(17, UrlVectors.Cast<object>().Count());
+        Assert.Equal(19, UrlVectors.Cast<object>().Count());
         Assert.Equal(18, HeaderVectors.Cast<object>().Count());
         Assert.Equal(7, PreflightVectors.Cast<object>().Count());
         Assert.Equal(10, RetryVectors.Cast<object>().Count());
-        Assert.Equal(8, RedactionVectors.Cast<object>().Count());
+        Assert.Equal(9, RedactionVectors.Cast<object>().Count());
         Assert.Equal(3, RedactionLengthVectors.Cast<object>().Count());
     }
 
@@ -521,6 +521,14 @@ public sealed class DecisionsTests
     {
         var vector = Fixtures.Vector("redaction", name);
         var payload = vector.GetProperty("body").GetString()!;
+        if (vector.TryGetProperty("bodyRepeat", out var repeat))
+        {
+            payload = payload.Replace(
+                "{{repeat}}",
+                string.Concat(Enumerable.Repeat(repeat.GetProperty("text").GetString()!, repeat.GetProperty("count").GetInt32())),
+                StringComparison.Ordinal);
+        }
+
         if (vector.TryGetProperty("bodyPrefix", out var prefix))
         {
             payload = new string(prefix.GetProperty("char").GetString()![0], prefix.GetProperty("count").GetInt32()) + payload;
@@ -902,6 +910,21 @@ public sealed class DecisionsTests
             Assert.Contains("redirect", error.Message, StringComparison.OrdinalIgnoreCase);
         }
 
+        Assert.Equal(3, runtime.GetEndpointCalls.Length);
+    }
+
+    [Fact]
+    public async Task Cancellation_Precedes_Redirect_Handler_Check()
+    {
+        await using var runtime = await FakeRuntime.StartAsync(OpenAiEndpoint);
+        using var follows = new HttpClientHandler { AllowAutoRedirect = true };
+        using var cts = new CancellationTokenSource();
+        cts.Cancel();
+
+        var error = await Record.ExceptionAsync(
+            () => runtime.Session.Decisions.CreateAsync(MinimalRequest(), new DecisionsOptions { Handler = follows }, cts.Token));
+
+        Assert.IsAssignableFrom<OperationCanceledException>(error);
         Assert.Empty(runtime.GetEndpointCalls);
     }
 
