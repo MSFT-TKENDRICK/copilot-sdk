@@ -41,6 +41,7 @@ from ._diagnostics import log_timing
 from ._jsonrpc import JsonRpcError, ProcessExitedError
 from ._telemetry import get_trace_context, trace_context
 from .canvas import CanvasError, CanvasHandler, OpenCanvasInstance
+from .decisions import SessionDecisionsApi
 from .generated.rpc import (
     AutoTier as _RpcAutoTier,
 )
@@ -2040,6 +2041,7 @@ class CopilotSession:
         self._open_canvases: list[OpenCanvasInstance] = []
         self._open_canvases_lock = threading.Lock()
         self._rpc: SessionRpc | None = None
+        self._decisions: SessionDecisionsApi | None = None
         self._destroyed = False
         self._response_waits: set[Callable[[], None]] = set()
         self._structured_waits: set[asyncio.Future[SessionEvent]] = set()
@@ -2141,6 +2143,29 @@ class CopilotSession:
             ...     ok = await session.ui.confirm("Deploy to production?")
         """
         return SessionUiApi(self)
+
+    @property
+    def decisions(self) -> SessionDecisionsApi:
+        """**Experimental.** OpenAI Decisions API calls against the session's provider.
+
+        Uses the endpoint and credentials returned by ``session.provider.getEndpoint``,
+        which requires the runtime to run with ``COPILOT_ALLOW_GET_PROVIDER_ENDPOINT=true``.
+        This API is experimental and may change or be removed in a future release.
+
+        Example:
+            >>> result = await session.decisions.create(
+            ...     {
+            ...         "model": "gpt-6-luna",
+            ...         "input": "The export button does nothing.",
+            ...         "questions": [{"type": "predicate", "instructions": "Is this a bug?"}],
+            ...     }
+            ... )
+        """
+        if self._decisions is None:
+            self._decisions = SessionDecisionsApi(
+                lambda params: self.rpc.provider.get_endpoint(params)
+            )
+        return self._decisions
 
     @functools.cached_property
     def workspace_path(self) -> pathlib.Path | None:
