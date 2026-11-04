@@ -1,6 +1,6 @@
 # Decisions (experimental)
 
-The Decisions API asks a model to answer one or more structured questions about some input and returns calibrated probabilities instead of free-form text. It is an OpenAI API (`POST /v1/decisions`, for example with `gpt-6-luna`). `session.decisions.create(...)` sends a Decisions request to **the session's own model provider**, using the endpoint and credentials the runtime already resolved for the session.
+The Decisions API asks a model to answer one or more structured questions about some input and returns calibrated probabilities instead of free-form text. It is an OpenAI API (`POST /v1/decisions`) that currently supports only `gpt-6-luna`. `session.decisions.create(...)` sends a Decisions request to **the session's own model provider**, using the endpoint and credentials the runtime already resolved for the session.
 
 > [!WARNING]
 > This API is **experimental** and may change or be removed. It is not part of the generated RPC surface. It is hand-written on top of the `session.provider.getEndpoint` RPC.
@@ -165,7 +165,7 @@ if let DecisionsAnswer::Predicate(answer) = &result.answers[0] {
 |---|---|
 | Endpoint model id (`endpointModelId`, `endpoint_model_id`, ...) | Passed verbatim as `modelId` to `session.provider.getEndpoint`, to pick a different provider endpoint than the session's current one. Never derived from `model`. |
 | Cancellation | `AbortSignal` (TypeScript), `timeout` (Python), `context.Context` (Go), `CancellationToken` (.NET), future cancellation (Java), or dropping the future (Rust). Cancellation surfaces as the platform's native cancellation error, not a Decisions error. |
-| Custom HTTP client | For proxies or custom TLS. Injected clients are trusted and **must not follow redirects**. The SDK never follows redirects, so credentials are never forwarded to another origin. |
+| Custom HTTP client | For proxies or custom TLS. The SDK's built-in clients never follow redirects. Injected clients are trusted and **must disable redirects**; otherwise credentials could be forwarded to another origin. (.NET and Java reject injected clients that are configured to follow redirects.) |
 
 ## Errors
 
@@ -182,9 +182,9 @@ Failures raise a Decisions error (`DecisionsError`, `DecisionsException`, or the
 | `invalidResponse` | The response is not valid Decisions JSON or exceeds 8 MiB. |
 | `network` | The request failed in transit. The `cause` is sanitized. |
 
-On a 401 or 403, the SDK refreshes the endpoint once and retries if the credentials changed.
+On a 401 or 403, the SDK refreshes the endpoint once and retries if the effective URL or credentials changed.
 
-**Credentials are never included** in error messages, bodies, or causes. API keys, session tokens, endpoint header values, and URL query values are redacted (including their JSON- and URL-encoded forms) before an error is raised.
+**Credentials are redacted** from Decisions HTTP error messages, response bodies, and parsed error fields, and network causes are sanitized. API keys, session tokens, endpoint header values, and URL query values are redacted (including their JSON- and URL-encoded forms). `endpointUnavailable` errors keep the runtime's original `getEndpoint` RPC error as their cause.
 
 ## See also
 

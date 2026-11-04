@@ -9,7 +9,7 @@ See [GitHub Releases](https://github.com/github/copilot-sdk/releases) for the fu
 
 ### Feature: experimental Decisions API
 
-All six SDKs add an experimental `session.decisions.create(...)` that calls the OpenAI Decisions API (`POST /decisions`) on the session's own OpenAI or Azure provider. It returns typed predicate, choice, and score answers. It is built on `session.provider.getEndpoint`, so the runtime must run with `COPILOT_ALLOW_GET_PROVIDER_ENDPOINT=true`. Credentials are redacted from all errors, and redirects are never followed. See [Decisions](./docs/features/decisions.md).
+All six SDKs add an experimental `session.decisions.create(...)` that calls the OpenAI Decisions API (`POST /decisions`) on the session's own OpenAI or Azure provider. It returns typed predicate, choice, and score answers. It is built on `session.provider.getEndpoint`, so the runtime must run with `COPILOT_ALLOW_GET_PROVIDER_ENDPOINT=true`. Credentials are redacted from HTTP errors, and the built-in HTTP clients never follow redirects. The API currently supports only `gpt-6-luna`. See [Decisions](./docs/features/decisions.md).
 
 ```ts
 const result = await session.decisions.create({
