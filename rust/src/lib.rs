@@ -25,6 +25,9 @@ mod cache_paths;
 /// Canvas declarations, provider callbacks, and host-side canvas RPC types.
 pub mod canvas;
 mod canvas_dispatch;
+/// **Experimental.** Provider Decisions API (`session.decisions()`).
+#[cfg(feature = "network-forwarding")]
+pub mod decisions;
 /// Bundled CLI binary extraction and caching.
 #[cfg(feature = "bundled-cli")]
 pub(crate) mod embeddedcli;
