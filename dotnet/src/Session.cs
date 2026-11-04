@@ -186,6 +186,17 @@ public sealed partial class CopilotSession : IAsyncDisposable
     /// </remarks>
     public ISessionUiApi Ui => field ?? Interlocked.CompareExchange(ref field, new SessionUiApiImpl(this), null) ?? field;
 
+    /// <summary>
+    /// Gets the experimental Decisions API, which calls OpenAI's Decisions endpoint directly against the
+    /// provider endpoint and credentials this session is configured with.
+    /// </summary>
+    /// <remarks>
+    /// Requires the runtime to run with <c>COPILOT_ALLOW_GET_PROVIDER_ENDPOINT=true</c>. The provider endpoint
+    /// is resolved on every call, and once more after a 401/403 response.
+    /// </remarks>
+    [Experimental(Diagnostics.Experimental)]
+    public ISessionDecisionsApi Decisions => field ?? Interlocked.CompareExchange(ref field, new SessionDecisionsApi(this), null) ?? field;
+
     internal ClientSessionApiHandlers ClientSessionApis { get; } = new();
 
     /// <summary>
