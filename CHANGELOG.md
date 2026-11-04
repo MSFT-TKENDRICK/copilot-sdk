@@ -7,6 +7,18 @@ See [GitHub Releases](https://github.com/github/copilot-sdk/releases) for the fu
 
 ## [Unreleased]
 
+### Feature: experimental Decisions API
+
+All six SDKs add an experimental `session.decisions.create(...)` that calls the OpenAI Decisions API (`POST /decisions`) on the session's own OpenAI or Azure provider. It returns typed predicate, choice, and score answers. It is built on `session.provider.getEndpoint`, so the runtime must run with `COPILOT_ALLOW_GET_PROVIDER_ENDPOINT=true`. Credentials are redacted from all errors, and redirects are never followed. See [Decisions](./docs/features/decisions.md).
+
+```ts
+const result = await session.decisions.create({
+    model: "gpt-6-luna",
+    input: "All health checks are green.",
+    questions: [{ type: "predicate", instructions: "Is the service healthy?" }],
+});
+```
+
 ### Feature: structured Policy Helper failures and scoped recheck
 
 Managed-settings snapshots across all six SDKs expose bounded Policy Helper failures: messages, remediation, details, help links, and diagnostics. Only applicable `session.create`/`session.resume` errors attach the DTO to `error.data.policyHelperFailure`, preserving primary code/message. Activation callers read `managedSettings.resolve(...).resolved.policyHelperFailure`.

@@ -512,6 +512,9 @@ Some Copilot features may behave differently with BYOK:
 | Ollama | No API key; local only; model support varies |
 | OpenAI | Subject to OpenAI rate limits and quotas |
 
+> [!TIP]
+> With an OpenAI or Azure provider, you can also call the experimental [Decisions API](../features/decisions.md) through the session's provider endpoint.
+
 ## Troubleshooting
 
 ### "Model not specified" error
