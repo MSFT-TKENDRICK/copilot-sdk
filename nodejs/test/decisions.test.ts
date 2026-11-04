@@ -695,6 +695,17 @@ describe("session.decisions.create", () => {
         expect(events.indexOf("read")).toBeLessThan(events.indexOf("fetch1"));
     });
 
+    it("truncates error bodies on a UTF-8 character boundary", async () => {
+        const payload = "x".repeat(MAX_ERROR_BODY_BYTES - 1) + "é".repeat(10);
+        const { fetch } = fakeFetch([() => new Response(payload, { status: 500 })]);
+        const error = (await captureError(
+            decisionsWith([openaiEndpoint]).create(minimalRequest, { fetch })
+        )) as DecisionsError;
+        expect(error.bodyTruncated).toBe(true);
+        expect(new TextEncoder().encode(error.body ?? "").byteLength).toBe(MAX_ERROR_BODY_BYTES - 1);
+        expect(error.body).not.toContain("\uFFFD");
+    });
+
     it("cancels oversized error bodies", async () => {
         let cancelled = false;
         const stream = new ReadableStream<Uint8Array>({

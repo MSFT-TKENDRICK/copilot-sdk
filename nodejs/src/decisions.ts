@@ -1016,9 +1016,11 @@ async function readRedactedErrorBody(
     const truncated = exceeded || bytes.byteLength > MAX_ERROR_BODY_BYTES;
     if (!truncated) return { raw, body: redacted, truncated };
     const encoded = new TextEncoder().encode(redacted);
+    let cut = MAX_ERROR_BODY_BYTES;
+    while (cut > 0 && (encoded[cut]! & 0xc0) === 0x80) cut--;
     return {
         raw,
-        body: decodeUtf8(encoded.subarray(0, MAX_ERROR_BODY_BYTES)),
+        body: decodeUtf8(encoded.subarray(0, cut)),
         truncated,
     };
 }
