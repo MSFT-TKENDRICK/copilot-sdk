@@ -18,7 +18,7 @@ These guides cover the capabilities you can add to your Copilot SDK application.
 | [Plugin Directories](./plugin-directories.md) | Bundle skills, hooks, MCP servers, and agents as a single loadable plugin |
 | [Session limits](./session-limits.md) | Set an AI Credits budget for a session and observe budget events |
 | [Citations](./citations.md) | Link assistant responses back to their supporting sources |
-| [Decisions (experimental)](./decisions.md) | Ask the session's OpenAI provider structured predicate, choice, and score questions |
+| [Decisions (experimental)](./decisions.md) | Typed predicate, choice, and score questions via the session's OpenAI/Azure provider; architecture, examples, and preview limitations |
 | [Image Input](./image-input.md) | Send images to sessions as attachments |
 | [Streaming Events](./streaming-events.md) | Subscribe to real-time session events (40+ event types) |
 | [Usage and Billing](./usage-and-billing.md) | Read token counts, context-window utilization, AI credit cost, and account quota |
