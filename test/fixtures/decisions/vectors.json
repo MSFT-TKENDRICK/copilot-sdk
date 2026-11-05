@@ -1,0 +1,1045 @@
+{
+  "$comment": "Normative session.decisions vectors; all six SDKs execute every case. Endpoints use ProviderEndpoint wire shape. Header expectations are the COMPLETE lowercase outbound set. bodyPrefix prepends char repeated count times; bodyRepeat substitutes every {{repeat}} with text repeated count times. mustNotContain applies to every retained error/cause field. bodyTruncated means original RAW body overflow beyond 65536 UTF-8 bytes, not redaction expansion. Retain only the original 65536-byte prefix, using lookahead solely to recognize crossing secrets; union overlapping original matches before replacement, then enforce maxBodyBytes on a UTF-8 boundary. Every nonempty actual credential is protected; only heuristic non-authentication header/query candidates use an eight-Unicode-scalar minimum. redactionLength values are apiKey credentials after SP/HTAB trimming. Hex digits in \\uXXXX and %XX escapes match case-insensitively; + is accepted for space. production-vectors.json extends this corpus with metadata, numeric, retry-guidance, body-failure, and deadline cases.",
+  "url": [
+    {
+      "name": "openai_v1",
+      "endpoint": {
+        "type": "openai",
+        "baseUrl": "https://api.openai.com/v1",
+        "headers": {}
+      },
+      "expected": "https://api.openai.com/v1/decisions"
+    },
+    {
+      "name": "openai_trailing_slash",
+      "endpoint": {
+        "type": "openai",
+        "baseUrl": "https://api.openai.com/v1/",
+        "headers": {}
+      },
+      "expected": "https://api.openai.com/v1/decisions"
+    },
+    {
+      "name": "openai_multiple_trailing_slashes",
+      "endpoint": {
+        "type": "openai",
+        "baseUrl": "https://api.openai.com/v1//",
+        "headers": {}
+      },
+      "expected": "https://api.openai.com/v1/decisions"
+    },
+    {
+      "name": "capi_root",
+      "endpoint": {
+        "type": "openai",
+        "baseUrl": "https://api.enterprise.githubcopilot.com",
+        "headers": {}
+      },
+      "expected": "https://api.enterprise.githubcopilot.com/decisions"
+    },
+    {
+      "name": "foundry_v1_via_openai_type",
+      "endpoint": {
+        "type": "openai",
+        "baseUrl": "https://res.openai.azure.com/openai/v1/",
+        "headers": {}
+      },
+      "expected": "https://res.openai.azure.com/openai/v1/decisions"
+    },
+    {
+      "name": "azure_root",
+      "endpoint": {
+        "type": "azure",
+        "baseUrl": "https://res.openai.azure.com",
+        "headers": {}
+      },
+      "expected": "https://res.openai.azure.com/openai/v1/decisions"
+    },
+    {
+      "name": "azure_root_slash",
+      "endpoint": {
+        "type": "azure",
+        "baseUrl": "https://res.openai.azure.com/",
+        "headers": {}
+      },
+      "expected": "https://res.openai.azure.com/openai/v1/decisions"
+    },
+    {
+      "name": "azure_already_v1",
+      "endpoint": {
+        "type": "azure",
+        "baseUrl": "https://res.openai.azure.com/openai/v1",
+        "headers": {}
+      },
+      "expected": "https://res.openai.azure.com/openai/v1/decisions"
+    },
+    {
+      "name": "azure_already_v1_mixed_case",
+      "endpoint": {
+        "type": "azure",
+        "baseUrl": "https://res.openai.azure.com/OpenAI/V1/",
+        "headers": {}
+      },
+      "expected": "https://res.openai.azure.com/OpenAI/V1/decisions"
+    },
+    {
+      "name": "azure_project_prefix",
+      "endpoint": {
+        "type": "azure",
+        "baseUrl": "https://res.services.ai.azure.com/api/projects/p1",
+        "headers": {}
+      },
+      "expected": "https://res.services.ai.azure.com/api/projects/p1/openai/v1/decisions"
+    },
+    {
+      "name": "query_preserved",
+      "endpoint": {
+        "type": "openai",
+        "baseUrl": "http://127.0.0.1:8080/v1?x=1",
+        "headers": {}
+      },
+      "expected": "http://127.0.0.1:8080/v1/decisions?x=1"
+    },
+    {
+      "name": "azure_query_preserved",
+      "endpoint": {
+        "type": "azure",
+        "baseUrl": "https://res.openai.azure.com/?api-version=preview",
+        "headers": {}
+      },
+      "expected": "https://res.openai.azure.com/openai/v1/decisions?api-version=preview"
+    },
+    {
+      "name": "fragment_dropped",
+      "endpoint": {
+        "type": "openai",
+        "baseUrl": "https://api.openai.com/v1#frag",
+        "headers": {}
+      },
+      "expected": "https://api.openai.com/v1/decisions"
+    },
+    {
+      "name": "relative_rejected",
+      "endpoint": {
+        "type": "openai",
+        "baseUrl": "/v1",
+        "headers": {}
+      },
+      "error": "invalidEndpoint"
+    },
+    {
+      "name": "empty_rejected",
+      "endpoint": {
+        "type": "openai",
+        "baseUrl": "",
+        "headers": {}
+      },
+      "error": "invalidEndpoint"
+    },
+    {
+      "name": "non_http_scheme_rejected",
+      "endpoint": {
+        "type": "openai",
+        "baseUrl": "ftp://files.example.com/v1",
+        "headers": {}
+      },
+      "error": "invalidEndpoint"
+    },
+    {
+      "name": "userinfo_rejected",
+      "endpoint": {
+        "type": "openai",
+        "baseUrl": "https://user:secretpassword@api.openai.com/v1",
+        "headers": {}
+      },
+      "error": "invalidEndpoint"
+    },
+    {
+      "name": "empty_userinfo_rejected",
+      "endpoint": {
+        "type": "openai",
+        "baseUrl": "https://@api.openai.com/v1",
+        "headers": {}
+      },
+      "error": "invalidEndpoint"
+    },
+    {
+      "name": "empty_userinfo_with_colon_rejected",
+      "endpoint": {
+        "type": "openai",
+        "baseUrl": "https://:@api.openai.com/v1",
+        "headers": {}
+      },
+      "error": "invalidEndpoint"
+    },
+    {
+      "name": "ipv6_loopback",
+      "endpoint": {"type": "openai", "baseUrl": "http://[::1]:8080/v1", "headers": {}},
+      "expected": "http://[::1]:8080/v1/decisions"
+    },
+    {
+      "name": "ipv6_https_nondefault_port",
+      "endpoint": {"type": "openai", "baseUrl": "https://[::1]:8443/v1", "headers": {}},
+      "expected": "https://[::1]:8443/v1/decisions"
+    },
+    {
+      "name": "canonical_host_port_dot_path_empty_query",
+      "endpoint": {"type": "openai", "baseUrl": "HTTPS://API.EXAMPLE.COM:443/a/../v1/?", "headers": {}},
+      "expected": "https://api.example.com/v1/decisions"
+    },
+    {
+      "name": "encoded_dot_segments",
+      "endpoint": {"type": "openai", "baseUrl": "https://api.example.com/a/%2e%2E/v1", "headers": {}},
+      "expected": "https://api.example.com/v1/decisions"
+    },
+    {
+      "name": "encoded_slash_preserved",
+      "endpoint": {"type": "openai", "baseUrl": "https://api.example.com/a%2Fb/v1", "headers": {}},
+      "expected": "https://api.example.com/a%2Fb/v1/decisions"
+    },
+    {
+      "name": "explicit_authority_required",
+      "endpoint": {"type": "openai", "baseUrl": "https:api.example.com/v1", "headers": {}},
+      "error": "invalidEndpoint"
+    },
+    {
+      "name": "raw_backslash_rejected",
+      "endpoint": {"type": "openai", "baseUrl": "https://api.example.com\\v1", "headers": {}},
+      "error": "invalidEndpoint"
+    },
+    {
+      "name": "raw_whitespace_rejected",
+      "endpoint": {"type": "openai", "baseUrl": " https://api.example.com/v1", "headers": {}},
+      "error": "invalidEndpoint"
+    },
+    {
+      "name": "raw_control_rejected",
+      "endpoint": {"type": "openai", "baseUrl": "https://api.example.com/\tv1", "headers": {}},
+      "error": "invalidEndpoint"
+    },
+    {
+      "name": "unencoded_unicode_uri_rejected",
+      "endpoint": {"type": "openai", "baseUrl": "https://api.example.com/v1?tag=\u00e9", "headers": {}},
+      "error": "invalidEndpoint"
+    },
+    {
+      "name": "port_above_uint16_rejected",
+      "endpoint": {"type": "openai", "baseUrl": "https://api.example.com:65536/v1", "headers": {}},
+      "error": "invalidEndpoint"
+    },
+    {
+      "name": "nonnumeric_port_rejected",
+      "endpoint": {"type": "openai", "baseUrl": "https://api.example.com:no/v1", "headers": {}},
+      "error": "invalidEndpoint"
+    },
+    {
+      "name": "invalid_percent_escape_rejected",
+      "endpoint": {"type": "openai", "baseUrl": "https://api.example.com/v%zz", "headers": {}},
+      "error": "invalidEndpoint"
+    }
+  ],
+  "headers": [
+    {
+      "name": "openai_api_key_bearer",
+      "endpoint": {
+        "type": "openai",
+        "baseUrl": "https://api.openai.com/v1",
+        "apiKey": "sk-test-0001",
+        "headers": {}
+      },
+      "expected": {
+        "authorization": "Bearer sk-test-0001",
+        "content-type": "application/json",
+        "accept": "application/json"
+      }
+    },
+    {
+      "name": "azure_api_key_header",
+      "endpoint": {
+        "type": "azure",
+        "baseUrl": "https://res.openai.azure.com",
+        "apiKey": "az-test-0001",
+        "headers": {}
+      },
+      "expected": {
+        "api-key": "az-test-0001",
+        "content-type": "application/json",
+        "accept": "application/json"
+      }
+    },
+    {
+      "name": "endpoint_authorization_wins_over_api_key",
+      "endpoint": {
+        "type": "openai",
+        "baseUrl": "https://api.openai.com/v1",
+        "apiKey": "sk-test-0001",
+        "headers": {
+          "Authorization": "Bearer custom-token",
+          "X-Extra": "1"
+        }
+      },
+      "expected": {
+        "authorization": "Bearer custom-token",
+        "x-extra": "1",
+        "content-type": "application/json",
+        "accept": "application/json"
+      }
+    },
+    {
+      "name": "endpoint_api_key_header_suppresses_bearer",
+      "endpoint": {
+        "type": "openai",
+        "baseUrl": "https://api.openai.com/v1",
+        "apiKey": "sk-test-0001",
+        "headers": {
+          "Api-Key": "header-key-0001"
+        }
+      },
+      "expected": {
+        "api-key": "header-key-0001",
+        "content-type": "application/json",
+        "accept": "application/json"
+      }
+    },
+    {
+      "name": "azure_entra_authorization_header",
+      "endpoint": {
+        "type": "azure",
+        "baseUrl": "https://res.openai.azure.com",
+        "apiKey": "az-test-0001",
+        "headers": {
+          "authorization": "Bearer entra-token"
+        }
+      },
+      "expected": {
+        "authorization": "Bearer entra-token",
+        "content-type": "application/json",
+        "accept": "application/json"
+      }
+    },
+    {
+      "name": "no_credentials",
+      "endpoint": {
+        "type": "openai",
+        "baseUrl": "http://127.0.0.1:8080/v1",
+        "headers": {}
+      },
+      "expected": {
+        "content-type": "application/json",
+        "accept": "application/json"
+      }
+    },
+    {
+      "name": "content_type_and_accept_forced",
+      "endpoint": {
+        "type": "openai",
+        "baseUrl": "https://api.openai.com/v1",
+        "headers": {
+          "Content-Type": "text/plain",
+          "ACCEPT": "*/*"
+        }
+      },
+      "expected": {
+        "content-type": "application/json",
+        "accept": "application/json"
+      }
+    },
+    {
+      "name": "session_token_added",
+      "endpoint": {
+        "type": "openai",
+        "baseUrl": "https://api.openai.com/v1",
+        "apiKey": "sk-test-0001",
+        "headers": {},
+        "sessionToken": {
+          "token": "session-token-0001",
+          "header": "X-Session-Token"
+        }
+      },
+      "expected": {
+        "authorization": "Bearer sk-test-0001",
+        "x-session-token": "session-token-0001",
+        "content-type": "application/json",
+        "accept": "application/json"
+      }
+    },
+    {
+      "name": "session_token_replaces_endpoint_header",
+      "endpoint": {
+        "type": "openai",
+        "baseUrl": "https://api.openai.com/v1",
+        "headers": {
+          "X-Session-Token": "stale"
+        },
+        "sessionToken": {
+          "token": "session-token-0001",
+          "header": "x-session-token"
+        }
+      },
+      "expected": {
+        "x-session-token": "session-token-0001",
+        "content-type": "application/json",
+        "accept": "application/json"
+      }
+    },
+    {
+      "name": "session_token_replaces_endpoint_authorization",
+      "endpoint": {
+        "type": "openai",
+        "baseUrl": "https://api.openai.com/v1",
+        "apiKey": "sk-test-0001",
+        "headers": {
+          "Authorization": "Bearer custom-token"
+        },
+        "sessionToken": {
+          "token": "Bearer session-token-0001",
+          "header": "authorization"
+        }
+      },
+      "expected": {
+        "authorization": "Bearer session-token-0001",
+        "content-type": "application/json",
+        "accept": "application/json"
+      }
+    },
+    {
+      "name": "session_token_conflicts_with_api_key_credential",
+      "endpoint": {
+        "type": "openai",
+        "baseUrl": "https://api.openai.com/v1",
+        "apiKey": "sk-test-0001",
+        "headers": {},
+        "sessionToken": {
+          "token": "session-token-0001",
+          "header": "Authorization"
+        }
+      },
+      "error": "credentialConflict"
+    },
+    {
+      "name": "azure_session_token_conflicts_with_api_key_credential",
+      "endpoint": {
+        "type": "azure",
+        "baseUrl": "https://res.openai.azure.com",
+        "apiKey": "az-test-0001",
+        "headers": {},
+        "sessionToken": {
+          "token": "session-token-0001",
+          "header": "API-KEY"
+        }
+      },
+      "error": "credentialConflict"
+    },
+    {
+      "name": "duplicate_same_value_collapses",
+      "endpoint": {
+        "type": "openai",
+        "baseUrl": "https://api.openai.com/v1",
+        "headers": {
+          "X-A": "1",
+          "x-a": "1"
+        }
+      },
+      "expected": {
+        "x-a": "1",
+        "content-type": "application/json",
+        "accept": "application/json"
+      }
+    },
+    {
+      "name": "duplicate_different_values_rejected",
+      "endpoint": {
+        "type": "openai",
+        "baseUrl": "https://api.openai.com/v1",
+        "headers": {
+          "X-A": "1",
+          "x-a": "2"
+        }
+      },
+      "error": "invalidEndpoint"
+    },
+    {
+      "name": "header_value_with_newline_rejected",
+      "endpoint": {
+        "type": "openai",
+        "baseUrl": "https://api.openai.com/v1",
+        "headers": {
+          "X-Bad": "a\r\nInjected: 1"
+        }
+      },
+      "error": "invalidEndpoint"
+    },
+    {
+      "name": "capi_headers_forwarded",
+      "endpoint": {
+        "type": "openai",
+        "baseUrl": "https://api.enterprise.githubcopilot.com",
+        "apiKey": "gho_test_0001",
+        "headers": {
+          "Content-Type": "application/json",
+          "Accept": "application/json",
+          "Openai-Intent": "conversation-agent",
+          "X-Interaction-Id": "abc",
+          "Copilot-Integration-Id": "copilot-sdk",
+          "Authorization": "Bearer gho_test_0001"
+        }
+      },
+      "expected": {
+        "authorization": "Bearer gho_test_0001",
+        "openai-intent": "conversation-agent",
+        "x-interaction-id": "abc",
+        "copilot-integration-id": "copilot-sdk",
+        "content-type": "application/json",
+        "accept": "application/json"
+      }
+    },
+    {
+      "name": "header_values_trimmed",
+      "endpoint": {
+        "type": "openai",
+        "baseUrl": "https://api.openai.com/v1",
+        "headers": {
+          "Authorization": "  Bearer header-secret-0002\t",
+          "X-A": " 1 "
+        },
+        "sessionToken": {
+          "token": " session-token-0001 ",
+          "header": "X-Session-Token"
+        }
+      },
+      "expected": {
+        "authorization": "Bearer header-secret-0002",
+        "x-a": "1",
+        "x-session-token": "session-token-0001",
+        "content-type": "application/json",
+        "accept": "application/json"
+      }
+    },
+    {
+      "name": "invalid_header_name_rejected",
+      "endpoint": {
+        "type": "openai",
+        "baseUrl": "https://api.openai.com/v1",
+        "headers": {
+          "Bad Name": "1"
+        }
+      },
+      "error": "invalidEndpoint"
+    },
+    {
+      "name": "header_vertical_tab_rejected",
+      "endpoint": {"type": "openai", "baseUrl": "https://api.example.com/v1", "headers": {"X-Bad": "one\u000btwo"}},
+      "error": "invalidEndpoint"
+    },
+    {
+      "name": "header_del_rejected",
+      "endpoint": {"type": "openai", "baseUrl": "https://api.example.com/v1", "headers": {"X-Bad": "one\u007ftwo"}},
+      "error": "invalidEndpoint"
+    },
+    {
+      "name": "header_internal_horizontal_tab_preserved",
+      "endpoint": {"type": "openai", "baseUrl": "https://api.example.com/v1", "headers": {"X-Trace": "one\ttwo"}},
+      "expected": {"x-trace": "one\ttwo", "content-type": "application/json", "accept": "application/json"}
+    }
+  ],
+  "retry": [
+    {
+      "name": "unchanged",
+      "first": {
+        "type": "openai",
+        "baseUrl": "https://api.openai.com/v1",
+        "apiKey": "sk-test-0001",
+        "headers": {}
+      },
+      "second": {
+        "type": "openai",
+        "baseUrl": "https://api.openai.com/v1",
+        "apiKey": "sk-test-0001",
+        "headers": {}
+      },
+      "retry": false
+    },
+    {
+      "name": "effective_api_key_changed",
+      "first": {
+        "type": "openai",
+        "baseUrl": "https://api.openai.com/v1",
+        "apiKey": "sk-test-0001",
+        "headers": {}
+      },
+      "second": {
+        "type": "openai",
+        "baseUrl": "https://api.openai.com/v1",
+        "apiKey": "sk-test-0002",
+        "headers": {}
+      },
+      "retry": true
+    },
+    {
+      "name": "shadowed_api_key_changed",
+      "first": {
+        "type": "openai",
+        "baseUrl": "https://api.openai.com/v1",
+        "apiKey": "sk-test-0001",
+        "headers": {
+          "Authorization": "Bearer custom-token"
+        }
+      },
+      "second": {
+        "type": "openai",
+        "baseUrl": "https://api.openai.com/v1",
+        "apiKey": "sk-test-0002",
+        "headers": {
+          "Authorization": "Bearer custom-token"
+        }
+      },
+      "retry": false
+    },
+    {
+      "name": "non_credential_header_changed",
+      "first": {
+        "type": "openai",
+        "baseUrl": "https://api.enterprise.githubcopilot.com",
+        "headers": {
+          "Authorization": "Bearer gho_test_0001",
+          "X-Interaction-Id": "a"
+        }
+      },
+      "second": {
+        "type": "openai",
+        "baseUrl": "https://api.enterprise.githubcopilot.com",
+        "headers": {
+          "authorization": "Bearer gho_test_0001",
+          "X-Interaction-Id": "b"
+        }
+      },
+      "retry": false
+    },
+    {
+      "name": "authorization_header_changed",
+      "first": {
+        "type": "openai",
+        "baseUrl": "https://api.openai.com/v1",
+        "headers": {
+          "Authorization": "Bearer custom-token"
+        }
+      },
+      "second": {
+        "type": "openai",
+        "baseUrl": "https://api.openai.com/v1",
+        "headers": {
+          "Authorization": "Bearer rotated-token"
+        }
+      },
+      "retry": true
+    },
+    {
+      "name": "session_token_changed",
+      "first": {
+        "type": "openai",
+        "baseUrl": "https://api.openai.com/v1",
+        "headers": {},
+        "sessionToken": {
+          "token": "session-token-0001",
+          "header": "X-Session-Token"
+        }
+      },
+      "second": {
+        "type": "openai",
+        "baseUrl": "https://api.openai.com/v1",
+        "headers": {},
+        "sessionToken": {
+          "token": "session-token-0002",
+          "header": "X-Session-Token"
+        }
+      },
+      "retry": true
+    },
+    {
+      "name": "base_url_changed",
+      "first": {
+        "type": "openai",
+        "baseUrl": "https://a.example.com/v1",
+        "apiKey": "sk-test-0001",
+        "headers": {}
+      },
+      "second": {
+        "type": "openai",
+        "baseUrl": "https://b.example.com/v1",
+        "apiKey": "sk-test-0001",
+        "headers": {}
+      },
+      "retry": true
+    },
+    {
+      "name": "query_changed",
+      "first": {
+        "type": "openai",
+        "baseUrl": "https://a.example.com/v1?sig=1",
+        "apiKey": "sk-test-0001",
+        "headers": {}
+      },
+      "second": {
+        "type": "openai",
+        "baseUrl": "https://a.example.com/v1?sig=2",
+        "apiKey": "sk-test-0001",
+        "headers": {}
+      },
+      "retry": true
+    },
+    {
+      "name": "second_endpoint_invalid",
+      "first": {
+        "type": "openai",
+        "baseUrl": "https://api.openai.com/v1",
+        "apiKey": "sk-test-0001",
+        "headers": {}
+      },
+      "second": {
+        "type": "anthropic",
+        "baseUrl": "https://api.anthropic.com",
+        "apiKey": "x",
+        "headers": {}
+      },
+      "retry": false
+    },
+    {
+      "name": "whitespace_only_change",
+      "first": {
+        "type": "openai",
+        "baseUrl": "https://api.openai.com/v1",
+        "headers": {
+          "Authorization": "Bearer header-secret-0001"
+        }
+      },
+      "second": {
+        "type": "openai",
+        "baseUrl": "https://api.openai.com/v1",
+        "headers": {
+          "Authorization": " Bearer header-secret-0001 "
+        }
+      },
+      "retry": false
+    }
+  ],
+  "preflight": [
+    {
+      "name": "anthropic_rejected",
+      "endpoint": {
+        "type": "anthropic",
+        "baseUrl": "https://api.anthropic.com",
+        "headers": {}
+      },
+      "model": "gpt-6-luna",
+      "error": "unsupportedProvider"
+    },
+    {
+      "name": "websockets_rejected",
+      "endpoint": {
+        "type": "openai",
+        "baseUrl": "https://api.openai.com/v1",
+        "headers": {},
+        "transport": "websockets"
+      },
+      "model": "gpt-6-luna",
+      "error": "unsupportedTransport"
+    },
+    {
+      "name": "http_transport_ok",
+      "endpoint": {
+        "type": "openai",
+        "baseUrl": "https://api.openai.com/v1",
+        "headers": {},
+        "transport": "http"
+      },
+      "model": "gpt-6-luna",
+      "error": null
+    },
+    {
+      "name": "token_model_mismatch_rejected",
+      "endpoint": {
+        "type": "openai",
+        "baseUrl": "https://api.openai.com/v1",
+        "headers": {},
+        "sessionToken": {
+          "token": "session-token-0001",
+          "header": "X-Session-Token",
+          "model": "gpt-5"
+        }
+      },
+      "model": "gpt-6-luna",
+      "error": "modelMismatch"
+    },
+    {
+      "name": "token_model_match_ok",
+      "endpoint": {
+        "type": "openai",
+        "baseUrl": "https://api.openai.com/v1",
+        "headers": {},
+        "sessionToken": {
+          "token": "session-token-0001",
+          "header": "X-Session-Token",
+          "model": "gpt-6-luna"
+        }
+      },
+      "model": "gpt-6-luna",
+      "error": null
+    },
+    {
+      "name": "provider_checked_before_url",
+      "endpoint": {
+        "type": "anthropic",
+        "baseUrl": "not a url",
+        "headers": {}
+      },
+      "model": "gpt-6-luna",
+      "error": "unsupportedProvider"
+    },
+    {
+      "name": "transport_checked_before_url",
+      "endpoint": {
+        "type": "openai",
+        "baseUrl": "not a url",
+        "headers": {},
+        "transport": "websockets"
+      },
+      "model": "gpt-6-luna",
+      "error": "unsupportedTransport"
+    }
+  ],
+  "redaction": [
+    {
+      "name": "api_key_and_token_redacted",
+      "endpoint": {
+        "type": "openai",
+        "baseUrl": "https://api.openai.com/v1",
+        "apiKey": "sk-test-secret-0001",
+        "headers": {},
+        "sessionToken": {
+          "token": "session-secret-0001",
+          "header": "X-Session-Token"
+        }
+      },
+      "status": 401,
+      "body": "{\"error\":{\"type\":\"invalid_request_error\",\"code\":\"invalid_api_key\",\"message\":\"Incorrect API key provided: sk-test-secret-0001 (token session-secret-0001)\",\"param\":null}}",
+      "mustNotContain": [
+        "sk-test-secret-0001",
+        "session-secret-0001"
+      ],
+      "errorCode": "invalid_api_key",
+      "errorType": "invalid_request_error"
+    },
+    {
+      "name": "endpoint_authorization_redacted",
+      "endpoint": {
+        "type": "openai",
+        "baseUrl": "https://api.openai.com/v1",
+        "headers": {
+          "Authorization": "Bearer header-secret-0001"
+        }
+      },
+      "status": 403,
+      "body": "forbidden for Bearer header-secret-0001",
+      "mustNotContain": [
+        "header-secret-0001"
+      ],
+      "errorCode": null,
+      "errorType": null
+    },
+    {
+      "name": "json_escaped_secret_redacted",
+      "endpoint": {
+        "type": "openai",
+        "baseUrl": "https://api.openai.com/v1",
+        "apiKey": "sk-test-\"q\\uoted\"/é-0001",
+        "headers": {}
+      },
+      "status": 401,
+      "body": "{\"error\": {\"type\": \"invalid_request_error\", \"code\": \"invalid_api_key\", \"message\": \"bad key sk-test-\\\"q\\\\uoted\\\"\\/\\u00e9-0001\", \"param\": null}}",
+      "mustNotContain": [
+        "sk-test-\"q\\uoted\"/é-0001",
+        "sk-test-\\\"q\\\\uoted\\\"/é-0001",
+        "sk-test-\\\"q\\\\uoted\\\"/\\u00e9-0001",
+        "sk-test-\\\"q\\\\uoted\\\"\\/\\u00e9-0001",
+        "q\\uoted"
+      ],
+      "errorCode": "invalid_api_key",
+      "errorType": "invalid_request_error"
+    },
+    {
+      "name": "query_secret_echoed",
+      "endpoint": {
+        "type": "openai",
+        "baseUrl": "https://api.openai.com/v1?sig=query-secret-0001",
+        "headers": {}
+      },
+      "status": 403,
+      "body": "{\"error\": {\"type\": \"forbidden\", \"code\": null, \"message\": \"denied for https://api.openai.com/v1/decisions?sig=query-secret-0001\", \"param\": null}}",
+      "mustNotContain": [
+        "query-secret-0001"
+      ],
+      "errorCode": null,
+      "errorType": "forbidden"
+    },
+    {
+      "name": "secret_across_truncation_boundary",
+      "endpoint": {
+        "type": "openai",
+        "baseUrl": "https://api.openai.com/v1",
+        "apiKey": "sk-boundary-secret-0001",
+        "headers": {}
+      },
+      "status": 500,
+      "bodyPrefix": {
+        "char": "x",
+        "count": 65530
+      },
+      "body": "sk-boundary-secret-0001 trailing",
+      "mustNotContain": [
+        "sk-bound",
+        "sk-boundary-secret-0001"
+      ],
+      "errorCode": null,
+      "errorType": null,
+      "bodyTruncated": true,
+      "maxBodyBytes": 65536
+    },
+    {
+      "name": "custom_header_secret_echoed",
+      "endpoint": {
+        "type": "openai",
+        "baseUrl": "https://api.openai.com/v1",
+        "headers": {
+          "X-Provider-Token": " custom-header-secret-0001 "
+        }
+      },
+      "status": 401,
+      "body": "{\"error\": {\"type\": \"invalid_request_error\", \"code\": null, \"message\": \"token custom-header-secret-0001 rejected\", \"param\": null}}",
+      "mustNotContain": [
+        "custom-header-secret-0001"
+      ],
+      "errorCode": null,
+      "errorType": "invalid_request_error"
+    },
+    {
+      "name": "uppercase_unicode_escape_redacted",
+      "endpoint": {
+        "type": "openai",
+        "baseUrl": "https://api.openai.com/v1",
+        "apiKey": "sk-test-\"q\\uoted\"/é-0001",
+        "headers": {}
+      },
+      "status": 401,
+      "body": "{\"error\":{\"type\":\"invalid_request_error\",\"code\":null,\"message\":\"bad key sk-test-\\\"q\\\\uoted\\\"/\\u00E9-0001\",\"param\":null}}",
+      "mustNotContain": [
+        "sk-test-\\\"q\\\\uoted\\\"/\\u00E9-0001",
+        "u00E9-0001"
+      ],
+      "errorCode": null,
+      "errorType": "invalid_request_error"
+    },
+    {
+      "name": "percent_encoding_any_case_and_plus_redacted",
+      "endpoint": {
+        "type": "openai",
+        "baseUrl": "https://api.openai.com/v1",
+        "apiKey": "pct secret/0001",
+        "headers": {}
+      },
+      "status": 400,
+      "body": "{\"error\": {\"type\": \"invalid_request_error\", \"code\": null, \"message\": \"a=pct+secret%2F0001 b=pct%20secret%2f0001 c=pct%20secret%2F0001\", \"param\": null}}",
+      "mustNotContain": [
+        "pct+secret%2F0001",
+        "pct%20secret%2f0001",
+        "pct%20secret%2F0001",
+        "secret%2"
+      ],
+      "errorCode": null,
+      "errorType": "invalid_request_error"
+    },
+    {
+      "name": "redaction_expansion_capped_without_truncation",
+      "endpoint": {
+        "type": "openai",
+        "baseUrl": "https://api.openai.com/v1",
+        "apiKey": "sk-abcd1",
+        "headers": {}
+      },
+      "status": 400,
+      "bodyRepeat": {
+        "text": "sk-abcd1 ",
+        "count": 7000
+      },
+      "body": "{\"error\": {\"type\": \"invalid_request_error\", \"code\": \"repeat\", \"message\": \"{{repeat}}\", \"param\": null}}",
+      "mustNotContain": [
+        "sk-abcd1"
+      ],
+      "errorCode": "repeat",
+      "errorType": "invalid_request_error",
+      "bodyTruncated": false,
+      "maxBodyBytes": 65536
+    },
+    {
+      "name": "redaction_shrink_must_not_expose_lookahead",
+      "endpoint": {"type": "openai", "baseUrl": "https://api.example.com/v1", "apiKey": "abcdefghijklmnopqrst", "headers": {}},
+      "status": 400,
+      "bodyRepeat": {"text": "x", "count": 65497},
+      "body": "abcdefghijklmnopqrstabcdefghijklmnopqrst{{repeat}}abcdefghijklmnopqrst tail",
+      "mustNotContain": ["abcdefgh", "abcdefghijklmnopqrs"],
+      "errorCode": null,
+      "errorType": null,
+      "bodyTruncated": true,
+      "maxBodyBytes": 65536
+    },
+    {
+      "name": "overlapping_secrets_union_before_replacement",
+      "endpoint": {
+        "type": "openai",
+        "baseUrl": "https://api.example.com/v1",
+        "apiKey": "abcdefghij",
+        "headers": {},
+        "sessionToken": {"header": "X-Session", "token": "efghijklmn"}
+      },
+      "status": 400,
+      "body": "{\"error\":{\"type\":\"invalid_request_error\",\"code\":\"overlap\",\"message\":\"abcdefghijklmn\"}}",
+      "mustNotContain": ["abcdefgh", "efghijklmn", "klmn"],
+      "errorCode": "overlap",
+      "errorType": "invalid_request_error",
+      "bodyTruncated": false,
+      "maxBodyBytes": 65536
+    },
+    {
+      "name": "self_overlapping_secret_matches",
+      "endpoint": {"type": "openai", "baseUrl": "https://api.example.com/v1", "apiKey": "abababab", "headers": {}},
+      "status": 400,
+      "body": "{\"error\":{\"type\":\"invalid_request_error\",\"code\":\"overlap\",\"message\":\"abababababab\"}}",
+      "mustNotContain": ["abab"],
+      "errorCode": "overlap",
+      "errorType": "invalid_request_error",
+      "bodyTruncated": false,
+      "maxBodyBytes": 65536
+    }
+  ],
+  "redactionLength": [
+    {
+      "name": "seven_scalar_credential_is_secret",
+      "value": "🔑🔑🔑🔑abc",
+      "isSecret": true
+    },
+    {
+      "name": "eight_scalars_secret",
+      "value": "🔑🔑🔑🔑abcd",
+      "isSecret": true
+    },
+    {
+      "name": "trimmed_short_credential_is_secret",
+      "value": " 1234567 ",
+      "isSecret": true
+    },
+    {
+      "name": "one_scalar_credential_is_secret",
+      "value": "Z",
+      "isSecret": true
+    }
+  ]
+}

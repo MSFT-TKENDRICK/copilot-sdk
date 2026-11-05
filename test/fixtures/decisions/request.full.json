@@ -1,0 +1,137 @@
+{
+  "model": "gpt-6-luna",
+  "input": [
+    {
+      "type": "message",
+      "role": "developer",
+      "content": "You triage incoming support tickets."
+    },
+    {
+      "type": "message",
+      "role": "system",
+      "content": [
+        { "type": "input_text", "text": "Answer only from the provided context." }
+      ]
+    },
+    {
+      "type": "message",
+      "role": "user",
+      "content": [
+        {
+          "type": "input_text",
+          "text": "Ticket #4821: the export button does nothing.",
+          "prompt_cache_breakpoint": { "mode": "explicit" }
+        },
+        {
+          "type": "input_image",
+          "image_url": "data:image/png;base64,iVBORw0KGgo=",
+          "detail": "high",
+          "prompt_cache_breakpoint": { "mode": "explicit" }
+        },
+        { "type": "input_json", "data": { "plan": "enterprise", "seats": 120 } },
+        { "type": "input_json", "data": [{ "id": 1 }, { "id": 2 }] }
+      ]
+    },
+    {
+      "role": "user",
+      "content": [
+        { "type": "input_text", "text": "Customer replied: still broken after refresh." },
+        { "type": "input_image", "image_url": "https://example.com/full.png", "detail": "original" }
+      ]
+    },
+    {
+      "type": "message",
+      "role": "assistant",
+      "content": [
+        { "type": "output_text", "text": "I will look up the account." },
+        { "type": "refusal", "refusal": "I cannot share internal notes." }
+      ],
+      "phase": "commentary"
+    },
+    {
+      "type": "function_call",
+      "call_id": "call_1",
+      "name": "lookup_account",
+      "arguments": "{\"ticket\":4821}",
+      "id": "fc_1",
+      "namespace": "crm",
+      "status": "completed"
+    },
+    {
+      "type": "function_call_output",
+      "call_id": "call_1",
+      "output": "{\"tier\":\"enterprise\"}",
+      "id": "fco_1",
+      "status": "completed"
+    },
+    {
+      "type": "function_call_output",
+      "call_id": "call_2",
+      "output": [
+        { "type": "input_text", "text": "Screenshot attached." },
+        { "type": "input_image", "image_url": "https://example.com/shot.png", "detail": "low" }
+      ]
+    },
+    {
+      "type": "custom_tool_call",
+      "call_id": "call_3",
+      "name": "grep_logs",
+      "input": "export failed",
+      "id": "ctc_1",
+      "namespace": "ops",
+      "status": "incomplete"
+    },
+    {
+      "type": "custom_tool_call_output",
+      "call_id": "call_3",
+      "output": "3 matches",
+      "id": "ctco_1",
+      "status": "in_progress"
+    },
+    {
+      "type": "future_item",
+      "payload": { "anything": [1, true, null] }
+    }
+  ],
+  "questions": [
+    {
+      "type": "predicate",
+      "name": "is_bug",
+      "instructions": "Is this ticket reporting a product defect?"
+    },
+    {
+      "type": "choice",
+      "name": "team",
+      "instructions": "Which team should own this ticket?",
+      "choices": [
+        { "value": "frontend", "description": "UI and client code" },
+        { "value": "backend" }
+      ]
+    },
+    {
+      "type": "choice",
+      "instructions": [
+        { "type": "input_text", "text": "Should we escalate?" },
+        { "type": "input_image", "image_url": "https://example.com/policy.png", "detail": "auto" },
+        { "type": "input_json", "data": { "sla_hours": 4 } }
+      ],
+      "choices": [
+        { "value": true, "description": "Escalate now" },
+        { "value": false }
+      ]
+    },
+    {
+      "type": "score",
+      "name": "severity",
+      "instructions": "How severe is the impact?",
+      "levels": [
+        { "label": "low", "description": "Cosmetic" },
+        { "label": "medium" },
+        { "label": "high", "description": "Blocks work" }
+      ]
+    }
+  ],
+  "prompt_cache_key": "support-triage-v1",
+  "prompt_cache_options": { "mode": "explicit", "ttl": "30m" },
+  "safety_identifier": "user-7f3a9c"
+}

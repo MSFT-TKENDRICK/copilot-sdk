@@ -1,0 +1,10 @@
+{
+  "model": "gpt-6-luna",
+  "input": "The export button does nothing when clicked.",
+  "questions": [
+    {
+      "type": "predicate",
+      "instructions": "Is this ticket reporting a product defect?"
+    }
+  ]
+}

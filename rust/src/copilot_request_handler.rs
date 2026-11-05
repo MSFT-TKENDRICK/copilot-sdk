@@ -437,7 +437,7 @@ fn strip_forbidden_headers(headers: &mut HeaderMap) {
 }
 
 #[cfg(feature = "network-forwarding")]
-static SHARED_HTTP_CLIENT: LazyLock<
+pub(crate) static SHARED_HTTP_CLIENT: LazyLock<
     Result<reqwest::Client, Box<dyn std::error::Error + Send + Sync>>,
 > = LazyLock::new(|| {
     let builder = reqwest::Client::builder();

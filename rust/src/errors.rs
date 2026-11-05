@@ -265,6 +265,10 @@ pub enum ErrorKind {
     InvalidConfig,
     /// A session-scoped GitHub token provider failed or returned invalid data.
     GitHubTokenProvider,
+    /// **Experimental.** A `session.decisions()` call failed. Use
+    /// [`Error::decisions_error`] for the details.
+    #[cfg(feature = "network-forwarding")]
+    Decisions(crate::decisions::DecisionsErrorKind),
 }
 
 impl fmt::Display for ErrorKind {
@@ -286,6 +290,8 @@ impl fmt::Display for ErrorKind {
             }
             ErrorKind::InvalidConfig => write!(f, "invalid configuration"),
             ErrorKind::GitHubTokenProvider => write!(f, "GitHub token provider error"),
+            #[cfg(feature = "network-forwarding")]
+            ErrorKind::Decisions(k) => write!(f, "Decisions API error ({k})"),
         }
     }
 }
@@ -394,6 +400,16 @@ impl Error {
     /// output.
     pub fn rpc_data(&self) -> Option<&Value> {
         self.rpc_data.as_deref()
+    }
+
+    /// **Experimental.** Returns the details of an [`ErrorKind::Decisions`]
+    /// error.
+    #[cfg(feature = "network-forwarding")]
+    pub fn decisions_error(&self) -> Option<&crate::decisions::DecisionsError> {
+        match &self.repr {
+            Repr::Custom(Custom { error, .. }) => error.downcast_ref(),
+            _ => None,
+        }
     }
 }
 

@@ -1,0 +1,3 @@
+# Synthetic apiKey in the secret_across_truncation_boundary shared vector.
+# This excludes one immutable historical finding, not a path or a future value.
+73ef992d5146595212e11c2f5877aab7f09a8f2b:test/fixtures/decisions/vectors.json:generic-api-key:791

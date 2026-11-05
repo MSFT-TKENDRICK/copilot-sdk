@@ -1,0 +1,544 @@
+name: Decisions conformance
+
+on:
+  pull_request:
+    paths:
+      - ".github/workflows/decisions.yml"
+      - ".gitattributes"
+      - ".gitleaksignore"
+      - "nodejs/**"
+      - "python/**"
+      - "go/**"
+      - "dotnet/**"
+      - "java/**"
+      - "rust/**"
+      - "test/decisions/**"
+      - "test/fixtures/decisions/**"
+  workflow_dispatch:
+    inputs:
+      base_sha:
+        description: Immutable feature base for the committed-range integrity check
+        required: true
+        default: da61ce3f
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: decisions-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  evidence-tools:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    env:
+      EVIDENCE_DIR: ${{ github.workspace }}-decisions-integrity
+      REQUESTED_BASE: ${{ github.event.pull_request.base.sha || inputs.base_sha }}
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1
+        with:
+          python-version: "3.12"
+      - name: Test evidence tools
+        run: |
+          mkdir -p "$EVIDENCE_DIR"
+          git --version
+          python --version
+          python -B -m unittest discover -s test/decisions -p 'test_verify_*.py' -q \
+            2>&1 | tee "$EVIDENCE_DIR/tests.log"
+      - name: Install verified scanner
+        run: |
+          archive="$RUNNER_TEMP/gitleaks_8.30.1_linux_x64.tar.gz"
+          curl --fail --silent --show-error --location \
+            https://github.com/gitleaks/gitleaks/releases/download/v8.30.1/gitleaks_8.30.1_linux_x64.tar.gz \
+            --output "$archive"
+          printf '%s  %s\n' \
+            551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb "$archive" \
+            | sha256sum --check -
+          mkdir -p "$RUNNER_TEMP/decisions-gitleaks"
+          tar -xzf "$archive" -C "$RUNNER_TEMP/decisions-gitleaks" gitleaks
+      - name: Check committed source integrity
+        run: |
+          [[ "$REQUESTED_BASE" =~ ^[a-fA-F0-9]{7,40}$ ]] || {
+            echo "An immutable base commit is required" >&2
+            exit 1
+          }
+          base="$(git merge-base "$REQUESTED_BASE" HEAD)"
+          python test/decisions/verify_integrity.py --repo "$PWD" --base "$base" \
+            --gitleaks "$RUNNER_TEMP/decisions-gitleaks/gitleaks" \
+            --output "$EVIDENCE_DIR/integrity.json" 2>&1 | tee "$EVIDENCE_DIR/integrity.log"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        if: always()
+        with:
+          name: decisions-integrity
+          path: ${{ env.EVIDENCE_DIR }}
+          if-no-files-found: error
+
+  node:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - version: "20.19.0"
+            label: floor
+          - version: "22.23.4"
+            label: primary
+    env:
+      EVIDENCE_DIR: ${{ github.workspace }}-decisions-node-${{ matrix.label }}
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e
+        with:
+          node-version: ${{ matrix.version }}
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1
+        with:
+          python-version: "3.12"
+      - name: Restore declared dependencies
+        run: |
+          mkdir -p "$EVIDENCE_DIR"
+          node --version
+          npm --version
+          npm exec --yes --package=npm@11.21.0 -- npm --version
+          npm exec --yes --package=npm@11.21.0 -- npm --prefix nodejs install \
+            --no-package-lock --no-audit --no-fund --loglevel verbose \
+            --logs-dir "$EVIDENCE_DIR/npm-debug" \
+            2>&1 | tee "$EVIDENCE_DIR/install.log"
+      - name: Typecheck and execute Decisions tests
+        working-directory: nodejs
+        run: |
+          npm run typecheck 2>&1 | tee "$EVIDENCE_DIR/typecheck.log"
+          npx --no-install tsc --noEmit -p tsconfig.test.json \
+            2>&1 | tee "$EVIDENCE_DIR/test-types.log"
+          export COPILOT_DECISIONS_VECTOR_CENSUS="$EVIDENCE_DIR/census.json"
+          npx --no-install vitest run test/decisions.test.ts --maxWorkers=2 \
+            --reporter=default --reporter=json --outputFile="$EVIDENCE_DIR/tests.json" \
+            2>&1 | tee "$EVIDENCE_DIR/tests.log"
+          python ../test/decisions/verify_coverage.py --sdk node "$EVIDENCE_DIR/census.json" \
+            --output "$EVIDENCE_DIR/coverage.json"
+      - name: Build and package public entry point
+        working-directory: nodejs
+        run: |
+          npm run build 2>&1 | tee "$EVIDENCE_DIR/build.log"
+          mkdir -p "$EVIDENCE_DIR/package"
+          npm pack --ignore-scripts --json --pack-destination "$EVIDENCE_DIR/package" \
+            2>&1 | tee "$EVIDENCE_DIR/package.log"
+          node scripts/package-smoke/run.mjs --tarball "$EVIDENCE_DIR/package" \
+            --output "$EVIDENCE_DIR/consumer-smoke" \
+            2>&1 | tee "$EVIDENCE_DIR/package-smoke.log"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        if: always()
+        with:
+          name: decisions-node-${{ matrix.label }}
+          path: |
+            ${{ env.EVIDENCE_DIR }}
+            !${{ env.EVIDENCE_DIR }}/consumer-smoke/**/node_modules/**
+          if-no-files-found: error
+
+  python:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - version: "3.11"
+            label: floor
+          - version: "3.12"
+            label: primary
+    env:
+      EVIDENCE_DIR: ${{ github.workspace }}-decisions-python-${{ matrix.label }}
+      UV_CONCURRENT_BUILDS: "2"
+      UV_CONCURRENT_INSTALLS: "2"
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1
+        with:
+          python-version: ${{ matrix.version }}
+      - name: Restore declared dependencies
+        working-directory: python
+        run: |
+          mkdir -p "$EVIDENCE_DIR"
+          python --version
+          python -m pip install uv==0.10.9
+          uv sync --locked --group dev --python "${{ matrix.version }}" \
+            2>&1 | tee "$EVIDENCE_DIR/sync.log"
+      - name: Provision and identify the real runtime
+        working-directory: python
+        run: |
+          export COPILOT_CLI_EXTRACT_DIR="$RUNNER_TEMP/decisions-cli/1.0.106-6"
+          uv run --no-sync python -m copilot download-runtime --version 1.0.106-6 \
+            2>&1 | tee "$EVIDENCE_DIR/runtime-download.log"
+          cli_path="$(uv run --no-sync python -c \
+            'from copilot._cli_download import ensure_runtime_wrapper; print(ensure_runtime_wrapper("1.0.106-6"))')"
+          printf 'Requested runtime release: %s\n' '1.0.106-6' \
+            | tee "$EVIDENCE_DIR/runtime-identity.log"
+          sha256sum "$cli_path" | tee -a "$EVIDENCE_DIR/runtime-identity.log"
+          echo "COPILOT_CLI_PATH=$cli_path" >> "$GITHUB_ENV"
+      - name: Execute Decisions and RPC regressions
+        working-directory: python
+        run: |
+          export COPILOT_DECISIONS_VECTOR_CENSUS="$EVIDENCE_DIR/census.json"
+          uv run --no-sync pytest tests/test_decisions.py tests/test_decisions_production.py \
+            tests/test_decisions_runtime.py test_jsonrpc.py test_rpc_timeout.py -q \
+            --junitxml="$EVIDENCE_DIR/tests.xml" --basetemp "$RUNNER_TEMP/decisions-pytest" \
+            2>&1 | tee "$EVIDENCE_DIR/tests.log"
+          python - "$EVIDENCE_DIR/tests.xml" <<'PY'
+          import sys
+          import xml.etree.ElementTree as ET
+          required = {
+              "test_calls_the_session_provider_when_gate_is_enabled",
+              "test_reports_endpoint_unavailable_when_gate_is_disabled",
+          }
+          cases = [
+              case for case in ET.parse(sys.argv[1]).iter("testcase")
+              if case.get("classname") == "tests.test_decisions_runtime.TestDecisionsE2E"
+          ]
+          if len(cases) != len(required) or {case.get("name") for case in cases} != required or any(
+              case.find(tag) is not None
+              for case in cases for tag in ("skipped", "failure", "error")
+          ):
+              raise SystemExit("Both real-CLI/local-provider tests must execute successfully")
+          PY
+          uv run --no-sync python ../test/decisions/verify_coverage.py --sdk python \
+            "$EVIDENCE_DIR/census.json" --output "$EVIDENCE_DIR/coverage.json"
+      - name: Lint, typecheck, and build
+        working-directory: python
+        run: |
+          uv run --no-sync ruff check . 2>&1 | tee "$EVIDENCE_DIR/lint.log"
+          uv run --no-sync ruff format --check . 2>&1 | tee "$EVIDENCE_DIR/format.log"
+          uv run --no-sync ty check copilot/decisions.py copilot/_jsonrpc.py \
+            tests/test_decisions.py tests/test_decisions_production.py tests/test_decisions_runtime.py \
+            tests/conftest.py 2>&1 | tee "$EVIDENCE_DIR/types.log"
+          uv build --out-dir "$EVIDENCE_DIR/dist" 2>&1 | tee "$EVIDENCE_DIR/build.log"
+          uv run --no-sync python ../test/decisions/smoke_python_package.py \
+            --source . --dist "$EVIDENCE_DIR/dist" \
+            2>&1 | tee "$EVIDENCE_DIR/package-smoke.json"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        if: always()
+        with:
+          name: decisions-python-${{ matrix.label }}
+          path: ${{ env.EVIDENCE_DIR }}
+          if-no-files-found: error
+
+  go:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      GOMAXPROCS: "2"
+      EVIDENCE_DIR: ${{ github.workspace }}-decisions-go-primary
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16
+        with:
+          go-version: "1.26.0"
+          cache-dependency-path: go/go.sum
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1
+        with:
+          python-version: "3.12"
+      - name: Test, build, vet, and check formatting
+        working-directory: go
+        run: |
+          mkdir -p "$EVIDENCE_DIR"
+          go version
+          export COPILOT_DECISIONS_VECTOR_CENSUS="$EVIDENCE_DIR/census.json"
+          go test -p 2 -json -run Decisions -count=1 ./... \
+            2>&1 | tee "$EVIDENCE_DIR/tests.jsonl"
+          go build -p 2 ./... 2>&1 | tee "$EVIDENCE_DIR/build.log"
+          go vet -p 2 ./... 2>&1 | tee "$EVIDENCE_DIR/vet.log"
+          gofmt -l decisions.go decisions_types.go decisions_test.go decisions_internal_test.go \
+            decisions_export_test.go decisions_production_test.go > "$EVIDENCE_DIR/gofmt.log"
+          test ! -s "$EVIDENCE_DIR/gofmt.log"
+          python ../test/decisions/verify_coverage.py --sdk go "$EVIDENCE_DIR/census.json" \
+            --output "$EVIDENCE_DIR/coverage.json"
+      - name: Verify supported Linux race instrumentation
+        working-directory: go
+        run: |
+          CGO_ENABLED=1 go test -race -p 2 -json -run Decisions -count=1 ./... \
+            2>&1 | tee "$EVIDENCE_DIR/race.jsonl"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        if: always()
+        with:
+          name: decisions-go-primary
+          path: ${{ env.EVIDENCE_DIR }}
+          if-no-files-found: error
+
+  dotnet:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    env:
+      DOTNET_PROCESSOR_COUNT: "2"
+      DOTNET_CLI_TELEMETRY_OPTOUT: "1"
+      EVIDENCE_DIR: ${{ github.workspace }}-decisions-dotnet-primary
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+      - uses: actions/setup-dotnet@26b0ec14cb23fa6904739307f278c14f94c95bf1
+        with:
+          dotnet-version: |
+            10.0.403
+            8.0.x
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1
+        with:
+          python-version: "3.12"
+      - name: Restore and build all SDK targets
+        working-directory: dotnet
+        run: |
+          mkdir -p "$EVIDENCE_DIR"
+          dotnet --info
+          dotnet restore test/GitHub.Copilot.SDK.Test.csproj --disable-parallel -m:2 -nr:false \
+            -p:CopilotSkipCliDownload=true 2>&1 | tee "$EVIDENCE_DIR/restore.log"
+          dotnet build src/GitHub.Copilot.SDK.csproj --no-restore --no-incremental -m:2 -nr:false \
+            -p:UseSharedCompilation=false -p:CopilotSkipCliDownload=true \
+            2>&1 | tee "$EVIDENCE_DIR/build.log"
+          dotnet build test/GitHub.Copilot.SDK.Test.csproj --no-restore --no-incremental \
+            -f net8.0 -m:2 -nr:false -p:BuildProjectReferences=false \
+            -p:UseSharedCompilation=false -p:CopilotSkipCliDownload=true \
+            2>&1 | tee "$EVIDENCE_DIR/test-build.log"
+      - name: Execute Decisions tests and formatting
+        working-directory: dotnet
+        run: |
+          export COPILOT_DECISIONS_VECTOR_CENSUS="$EVIDENCE_DIR/census.json"
+          dotnet test test/GitHub.Copilot.SDK.Test.csproj --no-build --no-restore -f net8.0 \
+            --filter 'FullyQualifiedName~GitHub.Copilot.Test.Unit.DecisionsTests' -m:2 -nr:false \
+            -p:CopilotSkipCliDownload=true --logger 'trx;LogFileName=decisions.trx' \
+            --results-directory "$EVIDENCE_DIR" 2>&1 | tee "$EVIDENCE_DIR/tests.log"
+          dotnet format whitespace . --folder \
+            --include src/Decisions.cs src/SessionDecisionsApi.cs test/Unit/DecisionsTests.cs \
+            test/Unit/DecisionsProductionTests.cs --verify-no-changes --verbosity normal \
+            --report "$EVIDENCE_DIR/format.json" 2>&1 | tee "$EVIDENCE_DIR/format.log"
+          python ../test/decisions/verify_coverage.py --sdk dotnet "$EVIDENCE_DIR/census.json" \
+            --output "$EVIDENCE_DIR/coverage.json"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        if: always()
+        with:
+          name: decisions-dotnet-primary
+          path: ${{ env.EVIDENCE_DIR }}
+          if-no-files-found: error
+
+  java:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    env:
+      JAVA_TOOL_OPTIONS: -XX:ActiveProcessorCount=2 -Xms64m -Xmx1024m
+      EVIDENCE_DIR: ${{ github.workspace }}-decisions-java-primary
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+      - uses: actions/setup-java@be666c2fcd27ec809703dec50e508c2fdc7f6654
+        id: java17
+        with:
+          distribution: microsoft
+          java-version: "17"
+      - uses: actions/setup-java@be666c2fcd27ec809703dec50e508c2fdc7f6654
+        with:
+          distribution: microsoft
+          java-version: "25"
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1
+        with:
+          python-version: "3.12"
+      - name: Test, package, and verify style
+        run: |
+          mkdir -p "$EVIDENCE_DIR"
+          java -version
+          export COPILOT_DECISIONS_VECTOR_CENSUS="$EVIDENCE_DIR/census.json"
+          chmod +x java/mvnw
+          cd java
+          ./mvnw -B -Pskip-test-harness -DskipITs=true -pl sdk clean verify \
+            '-Dtest=DecisionsTest*,DecisionsSessionAccessorTest' \
+            2>&1 | tee "$EVIDENCE_DIR/verify.log"
+          ./mvnw -B -pl sdk spotless:check checkstyle:check \
+            2>&1 | tee "$EVIDENCE_DIR/style.log"
+          mv sdk/target/surefire-reports "$EVIDENCE_DIR/reports-jdk25"
+          cp sdk/target/copilot-sdk-java-*.jar "$EVIDENCE_DIR/"
+          cd ..
+          python test/decisions/verify_coverage.py --sdk java "$EVIDENCE_DIR/census.json" \
+            --output "$EVIDENCE_DIR/coverage.json"
+      - name: Execute the same Decisions suite on Java 17
+        working-directory: java
+        env:
+          JAVA17_HOME: ${{ steps.java17.outputs.path }}
+        run: |
+          "$JAVA17_HOME/bin/java" -version 2>&1 | tee "$EVIDENCE_DIR/java17-version.log"
+          export COPILOT_DECISIONS_VECTOR_CENSUS="$EVIDENCE_DIR/census-jdk17.json"
+          ./mvnw -o -B -Pskip-test-harness -DskipITs=true -pl sdk \
+            jacoco:prepare-agent@wire-up-coverage-instrumentation surefire:test@default-test \
+            '-Dtest=DecisionsTest*,DecisionsSessionAccessorTest' \
+            "-Djvm=$JAVA17_HOME/bin/java" '-Dsurefire.jvm.args=' -DforkCount=1 \
+            -DfailIfNoTests=true -Dsurefire.failIfNoSpecifiedTests=true \
+            2>&1 | tee "$EVIDENCE_DIR/java17-tests.log"
+          mv sdk/target/surefire-reports "$EVIDENCE_DIR/reports-jdk17"
+          python ../test/decisions/verify_coverage.py --sdk java \
+            "$EVIDENCE_DIR/census-jdk17.json" --output "$EVIDENCE_DIR/coverage-jdk17.json"
+          python - "$EVIDENCE_DIR" <<'PY' | tee "$EVIDENCE_DIR/java-runtime-proof.json"
+          import json
+          import sys
+          import xml.etree.ElementTree as ET
+          from pathlib import Path
+          root = Path(sys.argv[1])
+          expected = {
+              "com.github.copilot.decisions.DecisionsTest": 205,
+              "com.github.copilot.DecisionsSessionAccessorTest": 3,
+          }
+          evidence = {}
+          for version in (25, 17):
+              reports = sorted((root / f"reports-jdk{version}").glob("TEST-*.xml"))
+              if len(reports) != len(expected):
+                  raise SystemExit(f"Missing or unexpected Java {version} reports")
+              seen = {}
+              for path in reports:
+                  suite = ET.parse(path).getroot()
+                  name = suite.get("name")
+                  cases = suite.findall("testcase")
+                  props = {p.get("name"): p.get("value") for p in suite.findall("./properties/property")}
+                  if (
+                      name not in expected or name in seen
+                      or int(suite.get("tests", "-1")) != expected[name]
+                      or len(cases) != expected[name]
+                      or props.get("java.specification.version") != str(version)
+                      or any(int(suite.get(k, "-1")) != 0 for k in ("failures", "errors", "skipped"))
+                      or any(
+                          case.get("classname") != name
+                          or any(case.find(tag) is not None for tag in (
+                              "failure", "error", "skipped", "flakyFailure", "flakyError",
+                              "rerunFailure", "rerunError",
+                          ))
+                          for case in cases
+                      )
+                  ):
+                      raise SystemExit(f"Invalid or unsuccessful Java {version} report: {path.name}")
+                  seen[name] = {"tests": len(cases), "javaVersion": props.get("java.version")}
+              if set(seen) != set(expected):
+                  raise SystemExit(f"Incomplete Java {version} suite")
+              evidence[str(version)] = seen
+          print(json.dumps({"status": "passed", "runtimes": evidence}, indent=2))
+          PY
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        if: always()
+        with:
+          name: decisions-java-primary
+          path: ${{ env.EVIDENCE_DIR }}
+          if-no-files-found: error
+
+  rust:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    env:
+      CARGO_BUILD_JOBS: "2"
+      RUST_TEST_THREADS: "2"
+      OPENSSL_STATIC: "0"
+      OPENSSL_NO_VENDOR: "1"
+      EVIDENCE_DIR: ${{ github.workspace }}-decisions-rust-primary
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1
+        with:
+          python-version: "3.12"
+      - name: Set up declared Rust toolchains and OpenSSL
+        run: |
+          mkdir -p "$EVIDENCE_DIR"
+          if ! pkg-config --atleast-version=3 openssl; then
+            sudo apt-get update
+            sudo apt-get install --no-install-recommends -y pkg-config libssl-dev
+          fi
+          pkg-config --modversion openssl
+          rustup toolchain install 1.94.0 --profile minimal --component clippy
+          rustup toolchain install nightly-2026-04-14 --profile minimal --component rustfmt
+          rustc +1.94.0 --version
+      - name: Test Decisions and shared-parser compatibility
+        working-directory: rust
+        run: |
+          unset COPILOT_SKIP_CLI_DOWNLOAD
+          export NO_PROXY="${NO_PROXY:+$NO_PROXY,}localhost,127.0.0.1,::1"
+          export no_proxy="$NO_PROXY"
+          export COPILOT_DECISIONS_VECTOR_CENSUS="$EVIDENCE_DIR/census.json"
+          cargo +1.94.0 test --locked --no-default-features \
+            --features network-forwarding,test-support --lib -- --test-threads=2 \
+            2>&1 | tee "$EVIDENCE_DIR/tests.log"
+          python ../test/decisions/verify_coverage.py --sdk rust "$EVIDENCE_DIR/census.json" \
+            --output "$EVIDENCE_DIR/coverage.json"
+          unset COPILOT_DECISIONS_VECTOR_CENSUS
+          grep -Fx 'test types::tests::exp_flag_value_round_trips_all_variants ... ok' \
+            "$EVIDENCE_DIR/tests.log"
+          grep -Fx 'test jsonrpc::tests::frame_decoder_preserves_message_classification_payloads_and_errors ... ok' \
+            "$EVIDENCE_DIR/tests.log"
+          cargo +1.94.0 test --locked --no-default-features \
+            --features network-forwarding,test-support --test session_events_test --test jsonrpc_test \
+            -- --exact image_tool_usage_round_trips_without_inline_payload_storage \
+            request_response_round_trip --test-threads=2 \
+            2>&1 | tee "$EVIDENCE_DIR/serde-integration.log"
+          grep -Fx 'test image_tool_usage_round_trips_without_inline_payload_storage ... ok' \
+            "$EVIDENCE_DIR/serde-integration.log"
+          grep -Fx 'test request_response_round_trip ... ok' "$EVIDENCE_DIR/serde-integration.log"
+      - name: Verify default-feature compilation, Clippy, and formatting
+        working-directory: rust
+        run: |
+          unset COPILOT_SKIP_CLI_DOWNLOAD
+          cargo +1.94.0 clippy --locked --features network-forwarding,test-support \
+            --all-targets -- -D warnings 2>&1 | tee "$EVIDENCE_DIR/clippy.log"
+          cargo +1.94.0 check --locked --features network-forwarding \
+            2>&1 | tee "$EVIDENCE_DIR/default-features.log"
+          cargo +nightly-2026-04-14 fmt --all -- --config-path .rustfmt.nightly.toml --check \
+            2>&1 | tee "$EVIDENCE_DIR/format.log"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        if: always()
+        with:
+          name: decisions-rust-primary
+          path: ${{ env.EVIDENCE_DIR }}
+          if-no-files-found: error
+
+  all-sdk-censuses:
+    needs: [evidence-tools, node, python, go, dotnet, java, rust]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1
+        with:
+          python-version: "3.12"
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
+        with:
+          pattern: decisions-*-primary
+          path: ${{ runner.temp }}/decisions-censuses
+      - name: Verify all six successful SDK censuses
+        run: |
+          mapfile -d '' censuses < <(find "$RUNNER_TEMP/decisions-censuses" -name census.json -print0)
+          test "${#censuses[@]}" -eq 6
+          python test/decisions/verify_coverage.py "${censuses[@]}" \
+            --output "$RUNNER_TEMP/decisions-coverage.json"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: decisions-complete-census
+          path: ${{ runner.temp }}/decisions-coverage.json
+          if-no-files-found: error

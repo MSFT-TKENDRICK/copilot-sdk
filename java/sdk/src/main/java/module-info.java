@@ -13,16 +13,18 @@ module com.github.copilot.java {
     requires static com.github.spotbugs.annotations;
     requires static java.compiler;
     requires static com.sun.jna;
-    requires java.net.http;
+    requires transitive java.net.http;
     requires java.logging;
 
     exports com.github.copilot;
+    exports com.github.copilot.decisions;
     exports com.github.copilot.generated;
     exports com.github.copilot.generated.rpc;
     exports com.github.copilot.rpc;
     exports com.github.copilot.tool;
 
     opens com.github.copilot to com.fasterxml.jackson.databind;
+    opens com.github.copilot.decisions to com.fasterxml.jackson.databind;
     opens com.github.copilot.generated to com.fasterxml.jackson.databind;
     opens com.github.copilot.generated.rpc to com.fasterxml.jackson.databind;
     opens com.github.copilot.rpc to com.fasterxml.jackson.databind;

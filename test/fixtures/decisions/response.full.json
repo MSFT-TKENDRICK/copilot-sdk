@@ -1,0 +1,58 @@
+{
+  "answers": [
+    {
+      "type": "predicate",
+      "name": "is_bug",
+      "probability": 0.93
+    },
+    {
+      "type": "choice",
+      "name": "team",
+      "choice": "frontend",
+      "confidence": 0.81,
+      "probabilities": [
+        { "value": "frontend", "probability": 0.81 },
+        { "value": "backend", "probability": 0.19 }
+      ]
+    },
+    {
+      "type": "choice",
+      "name": null,
+      "choice": true,
+      "confidence": 0.66,
+      "probabilities": [
+        { "value": true, "probability": 0.66 },
+        { "value": false, "probability": 0.34 }
+      ],
+      "future_field": "ignored"
+    },
+    {
+      "type": "score",
+      "name": "severity",
+      "score": 1.37,
+      "confidence": 0.58,
+      "probabilities": [
+        { "label": "low", "value": 0, "probability": 0.05 },
+        { "label": "medium", "value": 1, "probability": 0.53 },
+        { "label": "high", "value": 2, "probability": 0.42 }
+      ]
+    },
+    {
+      "type": "refusal",
+      "name": "pii_check"
+    },
+    {
+      "type": "ranking",
+      "name": "future_kind",
+      "ranked": ["a", "b"]
+    }
+  ],
+  "model": "gpt-6-luna-2026-10-01",
+  "usage": {
+    "input_tokens": 812,
+    "input_tokens_details": { "cached_tokens": 512, "cache_write_tokens": 128 },
+    "output_tokens": 24,
+    "output_tokens_details": { "reasoning_tokens": 16 },
+    "total_tokens": 836
+  }
+}

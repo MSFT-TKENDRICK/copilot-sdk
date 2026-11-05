@@ -538,6 +538,18 @@ class JsonRpcClient:
 
         return json.loads(content)
 
+    @staticmethod
+    def _complete_response(
+        future: asyncio.Future, result: Any = None, error: BaseException | None = None
+    ) -> None:
+        # A reader-thread delivery may already be queued when the caller's deadline cancels it.
+        if future.done():
+            return
+        if error is not None:
+            future.set_exception(error)
+        else:
+            future.set_result(result)
+
     def _handle_message(self, message: dict):
         """Handle an incoming message (response or notification)"""
         # Check if it's a response to our request
@@ -559,7 +571,7 @@ class JsonRpcClient:
                         )
                     else:
                         exc = ValueError("Invalid JSON-RPC error response: expected an object")
-                    loop.call_soon_threadsafe(future.set_exception, exc)
+                    loop.call_soon_threadsafe(self._complete_response, future, None, exc)
                 elif "result" in message:
                     result = message["result"]
                     # Invoke the inline callback synchronously in the reader
@@ -574,12 +586,12 @@ class JsonRpcClient:
                                 message["id"],
                                 exc_info=True,
                             )
-                            loop.call_soon_threadsafe(future.set_exception, exc)
+                            loop.call_soon_threadsafe(self._complete_response, future, None, exc)
                             return
-                    loop.call_soon_threadsafe(future.set_result, result)
+                    loop.call_soon_threadsafe(self._complete_response, future, result)
                 else:
                     exc = ValueError("Invalid JSON-RPC response")
-                    loop.call_soon_threadsafe(future.set_exception, exc)
+                    loop.call_soon_threadsafe(self._complete_response, future, None, exc)
                 return
 
         # Check if it's a notification from the server

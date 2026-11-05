@@ -114,6 +114,7 @@ import com.github.copilot.rpc.SessionCapabilities;
 import com.github.copilot.rpc.SessionEndHookInput;
 import com.github.copilot.rpc.SessionHooks;
 import com.github.copilot.rpc.SessionStartHookInput;
+import com.github.copilot.decisions.SessionDecisions;
 import com.github.copilot.rpc.SessionUiApi;
 import com.github.copilot.rpc.SessionUiCapabilities;
 import com.github.copilot.rpc.SubagentStartHookInput;
@@ -200,6 +201,7 @@ public final class CopilotSession implements AutoCloseable {
     private final SessionUiApi ui;
     private final JsonRpcClient rpc;
     private volatile SessionRpc sessionRpc;
+    private volatile SessionDecisions decisions;
     private final Set<EventSubscription> eventHandlers = new CopyOnWriteArraySet<>();
     private final AtomicReference<Map<String, ToolDefinition>> toolHandlers = new AtomicReference<>(Map.of());
     private final Object setToolsLock = new Object();
@@ -420,6 +422,30 @@ public final class CopilotSession implements AutoCloseable {
      */
     public SessionUiApi getUi() {
         return ui;
+    }
+
+    /**
+     * Returns the experimental Decisions API for this session, which calls OpenAI's
+     * Decisions API directly against the session's provider endpoint.
+     * <p>
+     * The runtime must run with {@code COPILOT_ALLOW_GET_PROVIDER_ENDPOINT=true}.
+     *
+     * @return the Decisions API (never {@code null})
+     * @apiNote This method is experimental and may change in a future version.
+     * @since 1.0.0
+     */
+    @CopilotExperimental
+    public SessionDecisions getDecisions() {
+        SessionDecisions current = decisions;
+        if (current == null) {
+            synchronized (this) {
+                current = decisions;
+                if (current == null) {
+                    decisions = current = new SessionDecisions(this);
+                }
+            }
+        }
+        return current;
     }
 
     /**

@@ -1,0 +1,8 @@
+{
+  "error": {
+    "type": "invalid_request_error",
+    "code": "unsupported_model",
+    "message": "The model 'gpt-4o' does not support the Decisions API.",
+    "param": "model"
+  }
+}

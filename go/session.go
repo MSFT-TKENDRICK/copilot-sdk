@@ -1660,6 +1660,34 @@ func (s *Session) UI() *SessionUI {
 	return &SessionUI{session: s}
 }
 
+// Decisions returns the Decisions API for this session. Requests are sent directly to the
+// session's provider endpoint, which the runtime only exposes when it runs with
+// COPILOT_ALLOW_GET_PROVIDER_ENDPOINT=true.
+//
+//	result, err := session.Decisions().Create(ctx, copilot.DecisionsRequest{
+//		Model: "gpt-6-luna",
+//		Input: "The checkout page throws on submit.",
+//		Questions: []copilot.DecisionsQuestion{
+//			copilot.DecisionsPredicateQuestion{Instructions: "Is this a bug report?"},
+//		},
+//	}, nil)
+//
+// Experimental: Decisions is part of the experimental Decisions API and may change or be
+// removed.
+func (s *Session) Decisions() *SessionDecisions {
+	return &SessionDecisions{resolve: s.getProviderEndpoint}
+}
+
+func (s *Session) getProviderEndpoint(ctx context.Context, params *rpc.SessionProviderGetEndpointRequest) (*rpc.ProviderEndpoint, error) {
+	if s.RPC == nil {
+		return nil, errors.New("session RPC is not available")
+	}
+	if params == nil {
+		return s.RPC.Provider.GetEndpoint(ctx)
+	}
+	return s.RPC.Provider.GetEndpoint(ctx, params)
+}
+
 // assertElicitation checks that the host supports elicitation and returns an error if not.
 func (s *Session) assertElicitation() error {
 	caps := s.Capabilities()

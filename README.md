@@ -11,6 +11,9 @@
 
 Agents for every app.
 
+> [!WARNING]
+> **Fork preview: OpenAI Decisions.** The `feature/decisions-api` branch adds an experimental typed Decisions API in all six SDKs. Credential-redaction, whole-call deadline, and validation hardening are under verification; the complete six-SDK and live-provider gates remain pending. This extension is **not production-ready** and is not installed by the upstream package commands below. See [how it works, examples, and current limitations](./docs/features/decisions.md) or [PR #1](https://github.com/MSFT-TKENDRICK/copilot-sdk/pull/1).
+
 Embed Copilot's agentic workflows in your application with the GitHub Copilot SDK for Python, TypeScript, Go, .NET, Java, and Rust.
 
 The GitHub Copilot SDK exposes the same engine behind Copilot CLI: a production-tested agent runtime you can invoke programmatically. No need to build your own orchestration—you define agent behavior, Copilot handles planning, tool invocation, file edits, and more.
@@ -155,7 +158,7 @@ All models available via Copilot CLI are supported in the SDK. The SDK also expo
 
 ### Is the SDK production-ready?
 
-The GitHub Copilot SDK is generally available and follows semantic versioning. See [CHANGELOG.md](./CHANGELOG.md) for release notes.
+The GitHub Copilot SDK is generally available and follows semantic versioning. See [CHANGELOG.md](./CHANGELOG.md) for release notes. This does **not** apply to this fork's experimental [Decisions extension](./docs/features/decisions.md#what-has-been-verified), whose validation and known limitations are documented separately.
 
 ### How do I report issues or request features?
 

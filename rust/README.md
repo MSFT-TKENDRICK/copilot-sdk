@@ -43,6 +43,107 @@ tool name is `<server-key>-<tool-name>`. For `available_tools` and
 or the raw `mcp:<server-key>-<tool-name>` form. For `custom_agents[].tools`
 and `default_agent.excluded_tools`, use `<server-key>-<tool-name>` directly.
 
+## Decisions (experimental)
+
+With `network-forwarding` enabled (included by the default features),
+`session.decisions()` calls the provider's OpenAI-compatible Decisions endpoint
+directly, without an agent turn, tool execution, or implicit session history.
+The runtime must support `session.provider.getEndpoint` and have
+`COPILOT_ALLOW_GET_PROVIDER_ENDPOINT=true` set before it starts. Only HTTP
+OpenAI/Azure endpoints are supported; this is not a translation to other
+providers' decision APIs.
+
+```rust,no_run
+# #[cfg(feature = "network-forwarding")]
+# async fn example(session: &github_copilot_sdk::Session) -> Result<(), github_copilot_sdk::Error> {
+use std::time::Duration;
+use github_copilot_sdk::decisions::{
+    DecisionsOptions, DecisionsPredicateQuestion, DecisionsQuestion, DecisionsRequest,
+};
+
+let request = DecisionsRequest::new(
+    "gpt-6-luna",
+    "The export button does nothing when clicked.",
+    vec![DecisionsQuestion::Predicate(DecisionsPredicateQuestion {
+        name: Some("is_bug".into()),
+        instructions: "Is this reporting a product defect?".into(),
+    })],
+);
+let result = session.decisions().create_with_timeout(
+    request,
+    DecisionsOptions {
+        endpoint_model_id: None,
+        http_client: None,
+    },
+    Some(Duration::from_secs(30)),
+).await?;
+assert_eq!(result.answers.len(), 1);
+# Ok(())
+# }
+```
+
+- `create(request)` and `create_with_options(request, options)` keep their
+  existing signatures and use a **600-second total-call deadline**. The deadline
+  includes endpoint lookup, credential refresh, both HTTP attempts, and body
+  reads; it is not restarted on replay. `create_with_timeout(..., None)` disables
+  it, and `Some(Duration::ZERO)` expires before I/O. Missing model validation
+  happens first.
+- Cancel natively by dropping the future, including through a caller-owned
+  `tokio::select!` or timeout. Acquired response streams are dropped on every
+  completion, failure, or cancellation path. The runtime-side endpoint RPC
+  cannot be cancelled, but a late reply cannot dispatch HTTP. No detached
+  per-call task or background body reader is created.
+- `request.model` is required and is independent of `options.endpoint_model_id`.
+  Typed question instructions allow text, images, and JSON, without cache
+  breakpoints. JSON input parts and explicitly raw input items remain supported.
+  The typed role/part combinations prevent unsupported content from being
+  constructed. The only documented prompt-cache TTL is `30m`.
+- At most one authentication replay occurs, only after a fully processed
+  401/403 and a changed effective URL or credential. An unreadable auth body
+  never triggers refresh/replay. Other HTTP/network failures are not retried.
+  A replay can be billed twice.
+- Inspect `Error::decisions_error()`. SDK deadline expiry is
+  `DecisionsErrorKind::Timeout` with no provider cause. Earlier timeouts imposed
+  by an injected HTTP client remain sanitized `Network` errors.
+  `retry_after_ms()` on an HTTP error is advisory only; it prefers a valid
+  `retry-after-ms` over decimal-seconds or canonical GMT `Retry-After`.
+- Known floating response fields must be finite JSON numbers; probabilities
+  and confidence are in `[0, 1]`. Scores can be fractional. Usage counters and
+  score-level values preserve signed int64 literals, including negative
+  sentinels. Integral decimal/exponent encodings are accepted only within
+  `[-9007199254740991, 9007199254740991]`. Missing counts default to zero;
+  explicit null, fractional, boolean, string, or out-of-range counts fail.
+- Success bodies are capped at 8 MiB. Error diagnostics retain only the
+  original first 64 KiB, with credential lookahead used only for boundary
+  detection, followed by a 64 KiB UTF-8-safe output cap. `body_truncated()` means
+  original-body overflow, not expansion caused by redaction.
+  Every nonempty known credential is protected, including short credentials,
+  common JSON/URL encodings, overlapping matches, and credentials from earlier
+  attempts in the same call. Other endpoint header and query values use an
+  eight-Unicode-scalar heuristic. Eligible query values retain both decoded
+  and raw percent/form representations, including invalid UTF-8 escapes.
+  Error metadata is
+  bounded/redacted, and raw endpoint-RPC errors are discarded. This is not
+  general PII removal or protection against arbitrary unknown encodings.
+- Endpoint URLs require an explicit `http://` or `https://` authority. Encode
+  Unicode URI components before passing them; raw whitespace, controls,
+  backslashes, userinfo, malformed escapes, and invalid ports are rejected.
+  Local HTTP, port zero, and bracketed IPv6 remain supported. The built-in
+  client does not follow redirects. Injected clients are trusted to enforce
+  their own redirect/TLS policies and may impose independent timeouts.
+
+Focused fixture and loopback-HTTP tests need no live provider credentials,
+Node harness, or running CLI. From this directory:
+
+```bash
+CARGO_BUILD_JOBS=2 cargo test --locked --no-default-features --features network-forwarding,test-support --lib decisions -- --test-threads=2
+```
+
+Set `COPILOT_DECISIONS_VECTOR_CENSUS` to an output JSON path to record shared
+cases **after their assertions pass**. A census is valid evidence only alongside
+a successful test-runner exit and comparison to the shared fixture identities.
+These tests do not establish live-provider or full-platform verification.
+
 ## Architecture
 
 ```text

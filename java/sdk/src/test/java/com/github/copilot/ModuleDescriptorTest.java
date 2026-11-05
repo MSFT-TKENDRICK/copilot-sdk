@@ -21,6 +21,8 @@ class ModuleDescriptorTest {
         ModuleDescriptor descriptor = module.getDescriptor();
         assertTrue(descriptor.exports().stream().anyMatch(export -> export.source().equals("com.github.copilot")));
         assertTrue(descriptor.exports().stream().anyMatch(export -> export.source().equals("com.github.copilot.rpc")));
+        assertTrue(descriptor.exports().stream()
+                .anyMatch(export -> export.source().equals("com.github.copilot.decisions")));
         assertTrue(descriptor.requires().stream()
                 .anyMatch(require -> require.name().equals("com.fasterxml.jackson.databind")));
     }

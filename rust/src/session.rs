@@ -1819,6 +1819,18 @@ impl Session {
         SessionUi { session: self }
     }
 
+    /// **Experimental.** Returns the Decisions sub-API, which calls the
+    /// provider Decisions API (`POST {baseUrl}/decisions`) for the session's
+    /// current provider.
+    ///
+    /// Requires the runtime to run with
+    /// `COPILOT_ALLOW_GET_PROVIDER_ENDPOINT=true`. See
+    /// [`crate::decisions`] for details.
+    #[cfg(feature = "network-forwarding")]
+    pub fn decisions(&self) -> crate::decisions::SessionDecisions<'_> {
+        crate::decisions::SessionDecisions { session: self }
+    }
+
     /// Returns an error if the host doesn't support elicitation.
     fn assert_elicitation(&self) -> Result<(), Error> {
         if self

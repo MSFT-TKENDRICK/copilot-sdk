@@ -24,6 +24,49 @@ replaces both with the CLI version published for that snapshot.
 npm install @github/copilot-sdk
 ```
 
+## Decisions API (experimental)
+
+`session.decisions.create(request, options)` calls the configured provider directly,
+without adding session history or invoking an agent turn. The runtime must enable
+`COPILOT_ALLOW_GET_PROVIDER_ENDPOINT=true`. See the
+[Decisions guide](../docs/features/decisions.md) for typed request examples.
+
+- `request.model` is required. `options.endpointModelId` selects the endpoint
+  independently; it is never inferred from the request model.
+- `options.timeoutMs` defaults to **600000** (ten minutes) for the **entire call**,
+  including endpoint lookup, both HTTP attempts, bodies, and credential refresh.
+  Set it to `null` to disable the SDK deadline, or to a finite positive number.
+  SDK expiry raises `DecisionsError` with `kind: "timeout"` and no provider cause.
+  `options.signal` preserves the caller's native cancellation reason. A pending
+  endpoint RPC cannot itself be cancelled, but the SDK stops waiting, observes
+  its eventual outcome, and never sends HTTP after expiry.
+- The built-in HTTP transport does not follow redirects or impose an earlier
+  header/body timeout. An injected `options.fetch` owns redirect and TLS policy;
+  its independent timeout is a sanitized `network` error.
+- At most one authentication replay is made, after a fully processed 401/403
+  and changed effective URL/credentials. An unreadable auth body is not replayed.
+  HTTP errors expose optional advisory `retryAfterMs`; it does not trigger retries.
+- Retained error diagnostics protect nonempty known credentials of any length
+  and supported literal/JSON/percent/form encodings. Other header/query values
+  use an eight-Unicode-scalar heuristic. Qualifying decoded query values also
+  retain their raw percent/form representation, including when decoding is lossy.
+  Known secrets remain protected across the logical call's single allowed replay,
+  without changing outbound credentials or replay eligibility.
+  This is not general PII removal or a
+  guarantee against arbitrary credential transformations. Error bodies retain
+  only the original 64-KiB prefix; redaction lookahead never becomes retained
+  text. `bodyTruncated` describes original-body overflow, not replacement growth.
+- Usage counters and score-probability indexes are signed JavaScript **safe
+  integers** (including negative provider sentinels). Unsafe, fractional, null,
+  boolean, and string counters are rejected rather than rounded; missing counters
+  default to zero. Fractional score values remain supported.
+
+Provider URLs must be encoded absolute HTTP(S) URLs with explicit authorities,
+without userinfo, raw whitespace/controls, backslashes, or invalid percent escapes.
+Header values trim only SP/HTAB and reject ASCII controls except HTAB, DEL, and
+unpaired surrogates. Valid Unicode scalar values remain available to custom
+transports; built-in header encoding failures are sanitized network errors.
+
 ## Model provider metadata
 
 `client.listModels()` and `client.rpc.models.list()` preserve the runtime's optional
@@ -2138,6 +2181,91 @@ try {
 
 ## Development
 
+### Build and consume this source snapshot
+
+Use Node `^20.19.0 || >=22.12.0`. This snapshot does not contain a Node lockfile,
+so bootstrap from the repository root with:
+
+```bash
+npm --prefix nodejs install --no-package-lock --no-audit --no-fund
+npm --prefix nodejs run typecheck
+npm --prefix nodejs run build
+```
+
+The build uses the existing TypeScript dependency to emit native ES modules and
+declarations into `nodejs/dist`. It also creates the advertised CommonJS entry
+points in `dist/cjs`, retaining one shared set of declaration types. These small
+bridges synchronously load the same ESM implementation using Node's native
+`require(esm)` support, available at the package's existing runtime floor
+([Node 20.19](https://nodejs.org/en/blog/release/v20.19.0) and
+[Node 22.12](https://nodejs.org/en/blog/release/v22.12.0) release notes).
+No bundler, TypeScript runtime loader, or Vitest source transform is required.
+The build rejects top-level `await` in SDK source because the CommonJS entry
+points require a synchronous module graph.
+
+To create a local distributable (this does **not** publish to npm):
+
+```bash
+mkdir -p .decisions-evidence/node/package
+npm --prefix nodejs pack --ignore-scripts --pack-destination "$PWD/.decisions-evidence/node/package"
+```
+
+This follows the explicit build above; `--ignore-scripts` avoids compiling it
+twice. Running `npm pack` without that flag builds automatically through
+`prepack`. In a separate consumer project, install the resulting `.tgz`, then use
+either:
+
+```javascript
+import { CopilotClient, DecisionsError } from "@github/copilot-sdk";
+import { joinSession } from "@github/copilot-sdk/extension";
+```
+
+```javascript
+const { CopilotClient, DecisionsError } = require("@github/copilot-sdk");
+const { joinSession } = require("@github/copilot-sdk/extension");
+```
+
+### Tarball consumer smoke for CI
+
+After the build and pack commands above, run this portable public command from
+the repository root:
+
+```bash
+node nodejs/scripts/package-smoke/run.mjs --tarball .decisions-evidence/node/package --output .decisions-evidence/node/consumer-smoke
+```
+
+`--tarball` accepts a `.tgz` file or a directory containing exactly one `.tgz`.
+`--output` must be a new directory outside `nodejs`; existing evidence is never
+overwritten or deleted. The equivalent npm script, when working inside
+`nodejs`, is `npm run test:package -- --tarball <path> --output <new-path>`.
+
+The runner uses only Node's standard library and the dependencies already
+installed by the bootstrap above: no installs, downloads, second build, npm
+cache, Python, system tar, or session-specific files. It extracts only regular
+files/directories from the archive, rejects links, traversal and SDK source
+files, then physically copies the declared installed dependency tree into the
+consumer (not symlinks to the checkout). It supports the normal npm
+`node_modules` layout; linked dependency layouts must first be bootstrapped
+with npm. Archive limits are 32 MiB compressed and 64 MiB decompressed.
+
+The copied public fixtures execute native ESM import and cold CommonJS require
+in separate processes, then check `.mts` and `.cts` consumers with the existing
+TypeScript 5.9 `NodeNext` compiler and `skipLibCheck: false`. Both entry points and
+declaration branches must resolve to the extracted tarball's `dist`; fixture,
+compiler, and checked declaration origins must stay inside the consumer.
+Inherited Node loaders/global search paths and compilation caching are disabled.
+Only runtime dependencies are present during the runtime checks; the existing
+`typescript` and `@types/node` copies are added afterward.
+
+`<output>/result.json` retains the archive/file hashes, toolchain, actual command
+arrays, timestamps, exit codes, and smoke results; per-command logs and origin
+reports remain alongside it, including on failure. A nonzero exit, missing
+report, assertion failure, or timeout fails the command. The smoke does not start
+a runtime or send model requests. Normal session operations still require a
+matching runtime; building and importing do not.
+
+### Existing integration tests
+
 From the repository root:
 
 ```bash
@@ -2147,7 +2275,7 @@ npm ci
 
 ```bash
 cd nodejs
-npm ci
+npm install --no-package-lock --no-audit --no-fund
 npm test
 ```
 
