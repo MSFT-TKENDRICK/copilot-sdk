@@ -204,12 +204,17 @@ jobs:
           python - "$EVIDENCE_DIR/tests.xml" <<'PY'
           import sys
           import xml.etree.ElementTree as ET
+          required = {
+              "test_calls_the_session_provider_when_gate_is_enabled",
+              "test_reports_endpoint_unavailable_when_gate_is_disabled",
+          }
           cases = [
               case for case in ET.parse(sys.argv[1]).iter("testcase")
-              if case.get("classname", "").endswith("test_decisions_runtime")
+              if case.get("classname") == "tests.test_decisions_runtime.TestDecisionsE2E"
           ]
-          if len(cases) != 2 or any(
-              case.find(tag) is not None for case in cases for tag in ("skipped", "failure", "error")
+          if len(cases) != len(required) or {case.get("name") for case in cases} != required or any(
+              case.find(tag) is not None
+              for case in cases for tag in ("skipped", "failure", "error")
           ):
               raise SystemExit("Both real-CLI/local-provider tests must execute successfully")
           PY
@@ -447,6 +452,7 @@ jobs:
       CARGO_BUILD_JOBS: "2"
       RUST_TEST_THREADS: "2"
       OPENSSL_STATIC: "0"
+      OPENSSL_NO_VENDOR: "1"
       EVIDENCE_DIR: ${{ github.workspace }}-decisions-rust-primary
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
@@ -471,6 +477,8 @@ jobs:
         working-directory: rust
         run: |
           unset COPILOT_SKIP_CLI_DOWNLOAD
+          export NO_PROXY="${NO_PROXY:+$NO_PROXY,}localhost,127.0.0.1,::1"
+          export no_proxy="$NO_PROXY"
           export COPILOT_DECISIONS_VECTOR_CENSUS="$EVIDENCE_DIR/census.json"
           cargo +1.94.0 test --locked --no-default-features \
             --features network-forwarding,test-support --lib -- --test-threads=2 \
