@@ -1,0 +1,89 @@
+{
+  "metadata": [
+    {
+      "name": "credential_in_http_request_id",
+      "apiKey": "synthetic-key-0001",
+      "status": 400,
+      "headers": {"x-request-id": "req:synthetic-key-0001"},
+      "body": "{\"error\":{\"type\":\"invalid_request_error\",\"message\":\"bad request\"}}",
+      "expectedRequestId": "req:[REDACTED]"
+    },
+    {
+      "name": "short_credential_in_http_request_id",
+      "apiKey": "XYZ",
+      "status": 400,
+      "headers": {"x-request-id": "req:XYZ"},
+      "body": "{\"error\":{\"type\":\"invalid_request_error\",\"message\":\"bad request\"}}",
+      "expectedRequestId": "req:[REDACTED]"
+    },
+    {
+      "name": "missing_http_request_id",
+      "apiKey": "synthetic-key-0001",
+      "status": 400,
+      "headers": {},
+      "body": "{}",
+      "expectedRequestId": null
+    },
+    {
+      "name": "bom_prefixed_error_body",
+      "apiKey": "synthetic-key-0001",
+      "status": 400,
+      "headers": {"x-request-id": "req-safe"},
+      "body": "\ufeff{\"error\":{\"type\":\"invalid_request_error\",\"code\":\"bad_input\",\"message\":\"bad request\"}}",
+      "expectedRequestId": "req-safe",
+      "expectedErrorType": "invalid_request_error",
+      "expectedErrorCode": "bad_input"
+    }
+  ],
+  "retryAfter": [
+    {"name": "absent", "headers": {}, "nowEpochMs": 1445412420000, "expectedMs": null},
+    {"name": "milliseconds_precedence", "headers": {"retry-after-ms": "1500", "retry-after": "9"}, "nowEpochMs": 1445412420000, "expectedMs": 1500},
+    {"name": "fractional_milliseconds_round_up", "headers": {"retry-after-ms": "0.1"}, "nowEpochMs": 1445412420000, "expectedMs": 1},
+    {"name": "seconds", "headers": {"retry-after": "2"}, "nowEpochMs": 1445412420000, "expectedMs": 2000},
+    {"name": "fractional_seconds", "headers": {"retry-after": "1.5001"}, "nowEpochMs": 1445412420000, "expectedMs": 1501},
+    {"name": "trim_http_whitespace", "headers": {"retry-after": " \t2.5\t "}, "nowEpochMs": 1445412420000, "expectedMs": 2500},
+    {"name": "invalid_ms_falls_back", "headers": {"retry-after-ms": "-1", "retry-after": "3"}, "nowEpochMs": 1445412420000, "expectedMs": 3000},
+    {"name": "zero", "headers": {"retry-after": "0"}, "nowEpochMs": 1445412420000, "expectedMs": 0},
+    {"name": "negative_invalid", "headers": {"retry-after": "-1"}, "nowEpochMs": 1445412420000, "expectedMs": null},
+    {"name": "exponent_invalid", "headers": {"retry-after": "1e3"}, "nowEpochMs": 1445412420000, "expectedMs": null},
+    {"name": "leading_plus_invalid", "headers": {"retry-after-ms": "+5"}, "nowEpochMs": 1445412420000, "expectedMs": null},
+    {"name": "nan_invalid", "headers": {"retry-after-ms": "NaN"}, "nowEpochMs": 1445412420000, "expectedMs": null},
+    {"name": "overflow_invalid", "headers": {"retry-after-ms": "9007199254740992"}, "nowEpochMs": 1445412420000, "expectedMs": null},
+    {"name": "valid_imf_fixdate", "headers": {"retry-after": "Wed, 21 Oct 2015 07:28:00 GMT"}, "nowEpochMs": 1445412420000, "expectedMs": 60000},
+    {"name": "past_imf_fixdate", "headers": {"retry-after": "Wed, 21 Oct 2015 07:26:00 GMT"}, "nowEpochMs": 1445412420000, "expectedMs": 0},
+    {"name": "non_gmt_date_invalid", "headers": {"retry-after": "Wed, 21 Oct 2015 07:28:00 PST"}, "nowEpochMs": 1445412420000, "expectedMs": null},
+    {"name": "impossible_calendar_date", "headers": {"retry-after": "Tue, 31 Feb 2015 07:28:00 GMT"}, "nowEpochMs": 1445412420000, "expectedMs": null}
+  ],
+  "responseNumbers": [
+    {"name": "negative_input_tokens", "target": "usage.input_tokens", "jsonValue": "-1", "expectedInteger": "-1"},
+    {"name": "negative_total_tokens", "target": "usage.total_tokens", "jsonValue": "-1", "expectedInteger": "-1"},
+    {"name": "negative_cached_tokens", "target": "usage.input_tokens_details.cached_tokens", "jsonValue": "-1", "expectedInteger": "-1"},
+    {"name": "fractional_token_count_invalid", "target": "usage.input_tokens", "jsonValue": "1.5", "expectedError": "invalidResponse"},
+    {"name": "boolean_token_count_invalid", "target": "usage.input_tokens", "jsonValue": "true", "expectedError": "invalidResponse"},
+    {"name": "null_token_count_invalid", "target": "usage.input_tokens", "jsonValue": "null", "expectedError": "invalidResponse"},
+    {"name": "string_token_count_invalid", "target": "usage.input_tokens", "jsonValue": "\"1\"", "expectedError": "invalidResponse"},
+    {"name": "integral_decimal_tokens", "target": "usage.input_tokens", "jsonValue": "3.0", "expectedInteger": "3"},
+    {"name": "integral_exponent_tokens", "target": "usage.input_tokens", "jsonValue": "3e0", "expectedInteger": "3"},
+    {"name": "huge_probability_invalid", "target": "answers.0.probability", "jsonValue": "1e400", "expectedError": "invalidResponse"},
+    {"name": "huge_integer_tokens_invalid", "target": "usage.input_tokens", "jsonValue": "99999999999999999999999999999999999999999999999999", "expectedError": "invalidResponse"},
+    {"name": "int64_max_tokens", "target": "usage.input_tokens", "jsonValue": "9223372036854775807", "expectedInteger": "9223372036854775807", "sdkErrors": {"node": "invalidResponse"}},
+    {"name": "int64_min_tokens", "target": "usage.input_tokens", "jsonValue": "-9223372036854775808", "expectedInteger": "-9223372036854775808", "sdkErrors": {"node": "invalidResponse"}},
+    {"name": "beyond_int64_tokens_invalid", "target": "usage.input_tokens", "jsonValue": "9223372036854775808", "expectedError": "invalidResponse"},
+    {"name": "safe_integer_max_tokens", "target": "usage.input_tokens", "jsonValue": "9007199254740991", "expectedInteger": "9007199254740991"},
+    {"name": "score_index_above_int32", "target": "answers.3.probabilities.0.value", "jsonValue": "2147483648", "expectedInteger": "2147483648"},
+    {"name": "negative_score_index", "target": "answers.3.probabilities.0.value", "jsonValue": "-1", "expectedInteger": "-1"},
+    {"name": "fractional_score_index_invalid", "target": "answers.3.probabilities.0.value", "jsonValue": "0.5", "expectedError": "invalidResponse"},
+    {"name": "fractional_score_preserved", "target": "answers.3.score", "jsonValue": "1.37", "expectedNumber": 1.37}
+  ],
+  "authBodyFailure": [
+    {"name": "unreadable_401_no_refresh_or_replay", "status": 401, "expectedError": "network", "expectedResolves": 1, "expectedSends": 1, "expectedBodyClosed": true},
+    {"name": "unreadable_403_no_refresh_or_replay", "status": 403, "expectedError": "network", "expectedResolves": 1, "expectedSends": 1, "expectedBodyClosed": true}
+  ],
+  "deadline": [
+    {"name": "initial_endpoint_deadline", "stage": "endpoint", "timeoutMs": 250, "expectedError": "timeout", "expectedResolves": 1, "expectedSends": 0},
+    {"name": "response_headers_deadline", "stage": "headers", "timeoutMs": 250, "expectedError": "timeout", "expectedResolves": 1, "expectedSends": 1},
+    {"name": "success_body_deadline", "stage": "successBody", "timeoutMs": 250, "expectedError": "timeout", "expectedResolves": 1, "expectedSends": 1},
+    {"name": "error_body_deadline", "stage": "errorBody", "status": 401, "timeoutMs": 250, "expectedError": "timeout", "expectedResolves": 1, "expectedSends": 1},
+    {"name": "refresh_endpoint_deadline", "stage": "refresh", "status": 401, "timeoutMs": 250, "expectedError": "timeout", "expectedResolves": 2, "expectedSends": 1}
+  ]
+}

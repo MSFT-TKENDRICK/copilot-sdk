@@ -9,15 +9,18 @@ import java.util.Objects;
 import com.github.copilot.CopilotExperimental;
 
 /**
- * Error raised by {@link SessionDecisions#create}. Messages,
- * {@link #getBody()}, and the error fields never contain credentials.
- * Cancellation is reported with the platform's
- * {@link java.util.concurrent.CancellationException}, not this type.
+ * Error raised by {@link SessionDecisions#create}. Provider diagnostics redact
+ * known endpoint credentials and supported encodings, including short
+ * authentication credentials. Other header and query values use an
+ * eight-Unicode-scalar heuristic. This is not general PII removal and does not
+ * cover arbitrary transformations unknown to the SDK. Cancellation is reported
+ * with the platform's {@link java.util.concurrent.CancellationException}, not
+ * this type.
  * <p>
  * For {@link DecisionsErrorKind#NETWORK} errors the cause is a
  * {@link DecisionsSanitizedCause}; for
- * {@link DecisionsErrorKind#ENDPOINT_UNAVAILABLE} it is the endpoint resolution
- * failure.
+ * {@link DecisionsErrorKind#ENDPOINT_UNAVAILABLE} it is a fixed safe stand-in,
+ * never the original endpoint RPC failure. SDK timeouts have no cause.
  *
  * @since 1.0.0
  */
@@ -34,6 +37,7 @@ public final class DecisionsException extends RuntimeException {
     private final String requestId;
     private final String body;
     private final Boolean bodyTruncated;
+    private final Long retryAfterMs;
 
     /**
      * Creates an exception with only a kind and message.
@@ -53,6 +57,12 @@ public final class DecisionsException extends RuntimeException {
 
     DecisionsException(DecisionsErrorKind kind, String message, Throwable cause, Integer status, String errorType,
             String errorCode, String errorParam, String requestId, String body, Boolean bodyTruncated) {
+        this(kind, message, cause, status, errorType, errorCode, errorParam, requestId, body, bodyTruncated, null);
+    }
+
+    DecisionsException(DecisionsErrorKind kind, String message, Throwable cause, Integer status, String errorType,
+            String errorCode, String errorParam, String requestId, String body, Boolean bodyTruncated,
+            Long retryAfterMs) {
         super(message, cause);
         this.kind = Objects.requireNonNull(kind, "kind");
         this.status = status;
@@ -62,6 +72,7 @@ public final class DecisionsException extends RuntimeException {
         this.requestId = requestId;
         this.body = body;
         this.bodyTruncated = bodyTruncated;
+        this.retryAfterMs = retryAfterMs;
     }
 
     /**
@@ -110,7 +121,8 @@ public final class DecisionsException extends RuntimeException {
     }
 
     /**
-     * Returns the {@code x-request-id} response header.
+     * Returns the bounded, credential-redacted {@code x-request-id} response
+     * header.
      *
      * @return the request ID, or {@code null}
      */
@@ -129,12 +141,23 @@ public final class DecisionsException extends RuntimeException {
     }
 
     /**
-     * Returns whether {@link #getBody()} was truncated at 64 KiB, for
-     * {@link DecisionsErrorKind#HTTP} errors.
+     * Returns whether the original response exceeded 64 KiB, for
+     * {@link DecisionsErrorKind#HTTP} errors. Redaction expansion alone does not
+     * set this flag.
      *
      * @return whether the body was truncated, or {@code null}
      */
     public Boolean getBodyTruncated() {
         return bodyTruncated;
+    }
+
+    /**
+     * Returns the provider's advisory retry delay, rounded up to milliseconds. This
+     * does not cause an automatic retry.
+     *
+     * @return the nonnegative delay for an HTTP error, or {@code null}
+     */
+    public Long getRetryAfterMs() {
+        return retryAfterMs;
     }
 }

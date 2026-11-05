@@ -10,6 +10,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"reflect"
 )
 
 // marshalDecisionsWire encodes v as compact JSON without HTML escaping.
@@ -29,6 +30,16 @@ func decisionsContent[T any](text string, parts []T) any {
 		return parts
 	}
 	return text
+}
+
+func validateDecisionsValues[T any](field string, values []T) error {
+	for _, value := range values {
+		v := reflect.ValueOf(value)
+		if !v.IsValid() || (v.Kind() == reflect.Pointer && v.IsNil()) {
+			return fmt.Errorf("%s must not contain nil items", field)
+		}
+	}
+	return nil
 }
 
 // ============================================================================
@@ -315,6 +326,9 @@ func (DecisionsUserMessage) decisionsInputItem() {}
 
 // MarshalJSON implements [json.Marshaler].
 func (m DecisionsUserMessage) MarshalJSON() ([]byte, error) {
+	if err := validateDecisionsValues("DecisionsUserMessage.ContentParts", m.ContentParts); err != nil {
+		return nil, err
+	}
 	return marshalDecisionsMessage(m.IncludeType, "user", decisionsContent(m.Content, m.ContentParts), "")
 }
 
@@ -356,6 +370,9 @@ func (DecisionsAssistantMessage) decisionsInputItem() {}
 
 // MarshalJSON implements [json.Marshaler].
 func (m DecisionsAssistantMessage) MarshalJSON() ([]byte, error) {
+	if err := validateDecisionsValues("DecisionsAssistantMessage.ContentParts", m.ContentParts); err != nil {
+		return nil, err
+	}
 	return marshalDecisionsMessage(m.IncludeType, "assistant", decisionsContent(m.Content, m.ContentParts), m.Phase)
 }
 
@@ -469,6 +486,11 @@ func (o DecisionsCustomToolCallOutput) MarshalJSON() ([]byte, error) {
 }
 
 func marshalDecisionsToolOutput(itemType, callID string, output any, id *string, status DecisionsItemStatus) ([]byte, error) {
+	if parts, ok := output.([]DecisionsToolOutputPart); ok {
+		if err := validateDecisionsValues("Decisions tool output parts", parts); err != nil {
+			return nil, err
+		}
+	}
 	return marshalDecisionsWire(struct {
 		Type   string              `json:"type"`
 		CallID string              `json:"call_id"`
@@ -610,6 +632,9 @@ func (DecisionsPredicateQuestion) decisionsQuestion() {}
 
 // MarshalJSON implements [json.Marshaler].
 func (q DecisionsPredicateQuestion) MarshalJSON() ([]byte, error) {
+	if err := validateDecisionsValues("Decisions question instruction parts", q.InstructionParts); err != nil {
+		return nil, err
+	}
 	return marshalDecisionsWire(struct {
 		Type         string  `json:"type"`
 		Name         *string `json:"name,omitempty"`
@@ -633,6 +658,9 @@ func (DecisionsChoiceQuestion) decisionsQuestion() {}
 
 // MarshalJSON implements [json.Marshaler].
 func (q DecisionsChoiceQuestion) MarshalJSON() ([]byte, error) {
+	if err := validateDecisionsValues("Decisions question instruction parts", q.InstructionParts); err != nil {
+		return nil, err
+	}
 	choices := q.Choices
 	if choices == nil {
 		choices = []DecisionsChoiceOption{}
@@ -661,6 +689,9 @@ func (DecisionsScoreQuestion) decisionsQuestion() {}
 
 // MarshalJSON implements [json.Marshaler].
 func (q DecisionsScoreQuestion) MarshalJSON() ([]byte, error) {
+	if err := validateDecisionsValues("Decisions question instruction parts", q.InstructionParts); err != nil {
+		return nil, err
+	}
 	levels := q.Levels
 	if levels == nil {
 		levels = []DecisionsScoreLevel{}
@@ -734,6 +765,12 @@ var errDecisionsModelRequired = errors.New("DecisionsRequest.Model is required")
 func (r DecisionsRequest) MarshalJSON() ([]byte, error) {
 	if r.Model == "" {
 		return nil, errDecisionsModelRequired
+	}
+	if err := validateDecisionsValues("DecisionsRequest.InputItems", r.InputItems); err != nil {
+		return nil, err
+	}
+	if err := validateDecisionsValues("DecisionsRequest.Questions", r.Questions); err != nil {
+		return nil, err
 	}
 	questions := r.Questions
 	if questions == nil {
@@ -832,8 +869,8 @@ func (a DecisionsChoiceAnswer) AnswerName() *string { return a.Name }
 // change or be removed.
 type DecisionsScoreProbability struct {
 	Label string
-	// Value is the integer index of the level.
-	Value       int
+	// Value is a signed 64-bit level index, including provider sentinel values.
+	Value       int64
 	Probability float64
 }
 
@@ -909,7 +946,8 @@ type DecisionsOutputTokensDetails struct {
 	ReasoningTokens int64
 }
 
-// DecisionsUsage reports token usage. Missing counts are zero.
+// DecisionsUsage reports signed 64-bit token usage, including provider sentinel values.
+// Missing counts are zero; present values must be integers.
 //
 // Experimental: DecisionsUsage is part of the experimental Decisions API and may change or be
 // removed.

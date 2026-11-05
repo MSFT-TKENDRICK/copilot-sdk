@@ -4,9 +4,11 @@
 
 using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.Globalization;
 using System.IO;
 using System.Linq;
+using System.Net;
 using System.Net.Http;
 using System.Net.Sockets;
 using System.Text;
@@ -37,12 +39,30 @@ internal sealed class SessionDecisionsApi(CopilotSession session) : ISessionDeci
         }
 
         options ??= s_defaultOptions;
+        using var lifetime = new DecisionsCallLifetime(options.Timeout, cancellationToken);
+        try
+        {
+            return await CreateCoreAsync(request, options, lifetime).ConfigureAwait(false);
+        }
+        catch
+        {
+            lifetime.Check();
+            throw;
+        }
+    }
+
+    private async Task<DecisionsResult> CreateCoreAsync(DecisionsRequest request, DecisionsOptions options, DecisionsCallLifetime lifetime)
+    {
         var handler = options.Handler;
-        cancellationToken.ThrowIfCancellationRequested();
+        var cancellationToken = lifetime.Token;
+        lifetime.Check();
 
         var model = request.Model;
-        var plan = DecisionsPlanner.Plan(await ResolveAsync(options, cancellationToken).ConfigureAwait(false), model);
+        var endpoint = await ResolveAsync(options, cancellationToken).ConfigureAwait(false);
+        lifetime.Check();
+        var plan = DecisionsPlanner.Plan(endpoint, model);
         var body = DecisionsWire.SerializeRequest(request);
+        lifetime.Check();
 
         if (handler is not null)
         {
@@ -67,7 +87,9 @@ internal sealed class SessionDecisionsApi(CopilotSession session) : ISessionDeci
                         response.Dispose();
                     }
 
+                    lifetime.Check();
                     var refreshedEndpoint = await ResolveAsync(options, cancellationToken).ConfigureAwait(false);
+                    lifetime.Check();
                     DecisionsAttemptPlan refreshed;
                     try
                     {
@@ -83,7 +105,9 @@ internal sealed class SessionDecisionsApi(CopilotSession session) : ISessionDeci
                         throw original;
                     }
 
-                    plan = refreshed;
+                    plan = new DecisionsAttemptPlan(refreshed.Url, refreshed.Headers, refreshed.Fingerprint,
+                        plan.Secrets.Concat(refreshed.Secrets).Distinct(StringComparer.Ordinal).ToArray());
+                    lifetime.Check();
                     response = await DecisionsHttp.SendAsync(client, plan, body, cancellationToken).ConfigureAwait(false);
                 }
 
@@ -126,7 +150,9 @@ internal sealed class SessionDecisionsApi(CopilotSession session) : ISessionDeci
 
                 using (document)
                 {
-                    return DecisionsWire.ParseResult(document.RootElement);
+                    var result = DecisionsWire.ParseResult(document.RootElement);
+                    lifetime.Check();
+                    return result;
                 }
             }
             finally
@@ -165,7 +191,12 @@ internal sealed class SessionDecisionsApi(CopilotSession session) : ISessionDeci
             var parameters = options.EndpointModelId is null
                 ? null
                 : new SessionProviderGetEndpointRequest { ModelId = options.EndpointModelId };
-            endpoint = await session.Rpc.Provider.GetEndpointAsync(parameters, cancellationToken).ConfigureAwait(false);
+            var pending = session.Rpc.Provider.GetEndpointAsync(parameters, cancellationToken);
+            // An in-flight RPC write cannot always be interrupted. Only observe late completion;
+            // the expired call must never continue to HTTP dispatch.
+            _ = pending.ContinueWith(static completed => { _ = completed.Exception; }, CancellationToken.None,
+                TaskContinuationOptions.OnlyOnFaulted | TaskContinuationOptions.ExecuteSynchronously, TaskScheduler.Default);
+            endpoint = await pending.WaitAsync(Timeout.InfiniteTimeSpan, cancellationToken).ConfigureAwait(false);
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
         {
@@ -196,7 +227,99 @@ internal sealed class SessionDecisionsApi(CopilotSession session) : ISessionDeci
         var message = gated
             ? $"session.decisions requires the runtime's provider endpoint API. Set {GateEnv}=true in the runtime's environment (for in-process runtimes, in the host process environment before the runtime is loaded)."
             : "Could not resolve the session's provider endpoint for the Decisions API.";
-        return new DecisionsException(DecisionsErrorKind.EndpointUnavailable, message, cause);
+        return new DecisionsException(DecisionsErrorKind.EndpointUnavailable, message);
+    }
+
+    /// <summary>One monotonic deadline and cancellation scope for the entire call.</summary>
+    internal sealed class DecisionsCallLifetime : IDisposable
+    {
+        internal static readonly TimeSpan DefaultTimeout = TimeSpan.FromSeconds(600);
+
+        private readonly object _gate = new();
+        private readonly TimeSpan _timeout;
+        private readonly CancellationToken _caller;
+        private readonly CancellationTokenSource _deadline = new();
+        private readonly CancellationTokenSource _linked;
+        private readonly Stopwatch _clock = Stopwatch.StartNew();
+        private readonly Timer? _timer;
+        private bool _disposed;
+
+        public DecisionsCallLifetime(TimeSpan? timeout, CancellationToken caller)
+        {
+            _timeout = timeout ?? DefaultTimeout;
+            if (_timeout != Timeout.InfiniteTimeSpan && _timeout <= TimeSpan.Zero)
+            {
+                _deadline.Dispose();
+                throw new ArgumentOutOfRangeException(nameof(timeout), "The Decisions timeout must be positive or infinite.");
+            }
+
+            _caller = caller;
+            _linked = CancellationTokenSource.CreateLinkedTokenSource(caller, _deadline.Token);
+            if (_timeout != Timeout.InfiniteTimeSpan)
+            {
+                _timer = new Timer(OnTimer, null, Timeout.Infinite, Timeout.Infinite);
+                OnTimer(null);
+            }
+        }
+
+        public CancellationToken Token => _linked.Token;
+
+        public void Check()
+        {
+            _caller.ThrowIfCancellationRequested();
+            if (_timeout != Timeout.InfiniteTimeSpan && _clock.Elapsed >= _timeout)
+            {
+                CancelDeadline();
+                _caller.ThrowIfCancellationRequested();
+                throw new DecisionsException(DecisionsErrorKind.Timeout, "The Decisions call exceeded its total-call deadline.");
+            }
+        }
+
+        private void OnTimer(object? state)
+        {
+            lock (_gate)
+            {
+                if (_disposed)
+                {
+                    return;
+                }
+
+                var remaining = _timeout - _clock.Elapsed;
+                if (remaining > TimeSpan.Zero)
+                {
+                    // Re-arm long deadlines without imposing the timer's platform-specific maximum.
+                    _timer!.Change((int)Math.Min(int.MaxValue, Math.Ceiling(remaining.TotalMilliseconds)), Timeout.Infinite);
+                }
+                else
+                {
+                    CancelDeadline();
+                }
+            }
+        }
+
+        private void CancelDeadline()
+        {
+            try
+            {
+                _deadline.Cancel();
+            }
+            catch (AggregateException)
+            {
+                // A custom cancellation callback cannot replace the safe timeout diagnostic.
+            }
+        }
+
+        public void Dispose()
+        {
+            lock (_gate)
+            {
+                _disposed = true;
+                _timer?.Dispose();
+            }
+
+            _linked.Dispose();
+            _deadline.Dispose();
+        }
     }
 
     private static void RethrowIfCancelled(Exception ex, CancellationToken cancellationToken)
@@ -231,7 +354,7 @@ internal sealed class DecisionsAttemptPlan(string url, IReadOnlyList<KeyValuePai
 internal static class DecisionsPlanner
 {
     private const int MinSecretLength = 8;
-    private static readonly char[] s_authorityTerminators = ['/', '?', '#', '\\'];
+    private static readonly char[] s_authorityTerminators = ['/', '?', '#'];
 
     public static DecisionsAttemptPlan Plan(ProviderEndpoint endpoint, string model)
     {
@@ -240,14 +363,14 @@ internal static class DecisionsPlanner
         {
             throw new DecisionsException(
                 DecisionsErrorKind.UnsupportedProvider,
-                $"The session's provider type '{type}' does not support the Decisions API.");
+                "The session's provider type does not support the Decisions API.");
         }
 
         if (endpoint.Transport is { } transport && !string.Equals(transport.Value, "http", StringComparison.Ordinal))
         {
             throw new DecisionsException(
                 DecisionsErrorKind.UnsupportedTransport,
-                $"The session's provider transport '{transport.Value}' is not supported by the Decisions API.");
+                "The session's provider transport is not supported by the Decisions API.");
         }
 
         var tokenModel = endpoint.SessionToken?.Model;
@@ -255,7 +378,7 @@ internal static class DecisionsPlanner
         {
             throw new DecisionsException(
                 DecisionsErrorKind.ModelMismatch,
-                $"The provider session token is bound to model '{tokenModel}', but the request uses '{model}'. Set endpointModelId or request.model consistently.");
+                "The provider session token is bound to a different model. Set endpointModelId or request.model consistently.");
         }
 
         var url = BuildUrl(type, endpoint.BaseUrl);
@@ -267,7 +390,7 @@ internal static class DecisionsPlanner
             Fingerprint(Lookup(headers, "authorization")),
             Fingerprint(Lookup(headers, "api-key")),
             tokenHeader is null ? "\u0001" : Fingerprint(tokenHeader) + "\u0000" + Fingerprint(Lookup(headers, tokenHeader)));
-        return new DecisionsAttemptPlan(url, headers, fingerprint, CollectSecrets(endpoint, url));
+        return new DecisionsAttemptPlan(url, headers, fingerprint, CollectSecrets(endpoint, url, headers));
     }
 
     private static string Fingerprint(string? value) => value is null ? "\u0001" : "\u0002" + value;
@@ -289,19 +412,30 @@ internal static class DecisionsPlanner
 
     internal static string BuildUrl(string type, string? baseUrl)
     {
-        if (string.IsNullOrEmpty(baseUrl) || !Uri.TryCreate(baseUrl, UriKind.Absolute, out var uri))
+        if (baseUrl is null
+            || !(baseUrl.StartsWith("http://", StringComparison.OrdinalIgnoreCase)
+                || baseUrl.StartsWith("https://", StringComparison.OrdinalIgnoreCase)))
+        {
+            throw InvalidEndpoint("The provider endpoint base URL must have an explicit http or https authority.");
+        }
+
+        for (var i = 0; i < baseUrl.Length; i++)
+        {
+            var c = baseUrl[i];
+            if (c is <= ' ' or >= '\x7F' or '\\'
+                || (c == '%' && (i + 2 >= baseUrl.Length || !Uri.IsHexDigit(baseUrl[i + 1]) || !Uri.IsHexDigit(baseUrl[i + 2]))))
+            {
+                throw InvalidEndpoint("The provider endpoint base URL contains invalid URI characters.");
+            }
+        }
+
+        var start = baseUrl.IndexOf("://", StringComparison.Ordinal) + 3;
+        var end = baseUrl.IndexOfAny(s_authorityTerminators, start);
+        var authority = end < 0 ? baseUrl.Substring(start) : baseUrl.Substring(start, end - start);
+        ValidateAuthority(authority);
+        if (!Uri.TryCreate(baseUrl, UriKind.Absolute, out var uri) || string.IsNullOrEmpty(uri.Host))
         {
             throw InvalidEndpoint("The provider endpoint base URL is not a valid absolute URL.");
-        }
-
-        if (!string.Equals(uri.Scheme, "http", StringComparison.Ordinal) && !string.Equals(uri.Scheme, "https", StringComparison.Ordinal))
-        {
-            throw InvalidEndpoint("The provider endpoint base URL must use http or https.");
-        }
-
-        if (!string.IsNullOrEmpty(uri.UserInfo) || RawAuthorityHasUserInfo(baseUrl!))
-        {
-            throw InvalidEndpoint("The provider endpoint base URL must not contain credentials.");
         }
 
         var basePath = uri.AbsolutePath.TrimEnd('/');
@@ -317,18 +451,67 @@ internal static class DecisionsPlanner
         return uri.GetComponents(UriComponents.SchemeAndServer, UriFormat.UriEscaped) + basePath + suffix + query;
     }
 
-    private static bool RawAuthorityHasUserInfo(string url)
+    private static void ValidateAuthority(string authority)
     {
-        var start = url.IndexOf("://", StringComparison.Ordinal);
-        if (start < 0)
+        if (authority.Length == 0 || authority.AsSpan().IndexOf('@') >= 0)
         {
-            return false;
+            throw InvalidEndpoint("The provider endpoint base URL must have a host and no user information.");
         }
 
-        start += 3;
-        var end = url.IndexOfAny(s_authorityTerminators, start);
-        var at = url.IndexOf('@', start);
-        return at >= 0 && (end < 0 || at < end);
+        string? port = null;
+        if (authority[0] == '[')
+        {
+            var close = authority.IndexOf(']');
+            if (close < 0 || authority.AsSpan().IndexOf('%') >= 0
+#if NET
+                || !IPAddress.TryParse(authority.AsSpan(1, close - 1), out var address)
+#else
+                || !IPAddress.TryParse(authority.Substring(1, close - 1), out var address)
+#endif
+                || address.AddressFamily != AddressFamily.InterNetworkV6)
+            {
+                throw InvalidEndpoint("The provider endpoint base URL has an invalid host.");
+            }
+
+            if (close + 1 < authority.Length)
+            {
+                if (authority[close + 1] != ':')
+                {
+                    throw InvalidEndpoint("The provider endpoint base URL has an invalid authority.");
+                }
+
+                port = authority.Substring(close + 2);
+            }
+        }
+        else
+        {
+            var colon = authority.IndexOf(':');
+            var host = colon < 0 ? authority : authority.Substring(0, colon);
+            if (colon >= 0)
+            {
+                port = authority.Substring(colon + 1);
+            }
+
+            var labels = (host.Length > 0 && host[host.Length - 1] == '.' ? host.Substring(0, host.Length - 1) : host).Split('.');
+            if (host.Length > 254 || labels.Any(label => label.Length is 0 or > 63
+                || label[0] == '-' || label[label.Length - 1] == '-'
+                || label.Any(c => c is not ((>= 'a' and <= 'z') or (>= 'A' and <= 'Z') or (>= '0' and <= '9') or '-'))))
+            {
+                throw InvalidEndpoint("The provider endpoint base URL has an invalid host.");
+            }
+
+            if (host.All(c => c is (>= '0' and <= '9') or '.')
+                && (labels.Length != 4 || labels.Any(label => !byte.TryParse(label, NumberStyles.None, CultureInfo.InvariantCulture, out _))))
+            {
+                throw InvalidEndpoint("The provider endpoint base URL has an invalid IPv4 host.");
+            }
+        }
+
+        if (port is not null && (port.Length == 0 || port.Any(c => c is < '0' or > '9')
+            || !ushort.TryParse(port, NumberStyles.None, CultureInfo.InvariantCulture, out _)))
+        {
+            throw InvalidEndpoint("The provider endpoint base URL has an invalid port.");
+        }
     }
 
     private static bool IsTokenChar(char c) =>
@@ -350,7 +533,7 @@ internal static class DecisionsPlanner
             }
         }
 
-        if (!valid || value.IndexOfAny(['\r', '\n', '\0']) >= 0)
+        if (!valid || value.Any(c => (c < ' ' && c != '\t') || c == '\x7F') || DecisionsText.HasLoneSurrogate(value))
         {
             throw InvalidEndpoint("The provider endpoint returned an invalid HTTP header.");
         }
@@ -377,6 +560,7 @@ internal static class DecisionsPlanner
     internal static List<KeyValuePair<string, string>> BuildHeaders(ProviderEndpoint endpoint)
     {
         var merged = new List<KeyValuePair<string, string>>();
+        var apiKey = endpoint.ApiKey is null ? null : CheckHeader("api-key", endpoint.ApiKey);
         foreach (var entry in endpoint.Headers)
         {
             if (entry.Value is null)
@@ -401,17 +585,17 @@ internal static class DecisionsPlanner
         }
 
         string? apiKeyHeader = null;
-        if (!string.IsNullOrEmpty(endpoint.ApiKey) && Lookup(merged, "authorization") is null && Lookup(merged, "api-key") is null)
+        if (!string.IsNullOrEmpty(apiKey) && Lookup(merged, "authorization") is null && Lookup(merged, "api-key") is null)
         {
             if (string.Equals(endpoint.Type.Value, "azure", StringComparison.Ordinal))
             {
                 apiKeyHeader = "api-key";
-                Set(merged, apiKeyHeader, CheckHeader(apiKeyHeader, endpoint.ApiKey!));
+                Set(merged, apiKeyHeader, apiKey!);
             }
             else
             {
                 apiKeyHeader = "authorization";
-                Set(merged, apiKeyHeader, "Bearer " + CheckHeader(apiKeyHeader, endpoint.ApiKey!));
+                Set(merged, apiKeyHeader, "Bearer " + apiKey);
             }
         }
 
@@ -434,11 +618,11 @@ internal static class DecisionsPlanner
         return merged;
     }
 
-    internal static IReadOnlyList<string> CollectSecrets(ProviderEndpoint endpoint, string url)
+    internal static IReadOnlyList<string> CollectSecrets(ProviderEndpoint endpoint, string url, IReadOnlyList<KeyValuePair<string, string>> headers)
     {
         var raw = new List<string>();
         var seen = new HashSet<string>(StringComparer.Ordinal);
-        void Add(string? value)
+        void Add(string? value, bool credential = false)
         {
             if (value is null)
             {
@@ -446,26 +630,36 @@ internal static class DecisionsPlanner
             }
 
             var trimmed = TrimHttpWhitespace(value);
-            if (DecisionsText.ScalarLength(trimmed) >= MinSecretLength && seen.Add(trimmed))
+            if (trimmed.Length > 0 && (credential || DecisionsText.ScalarLength(trimmed) >= MinSecretLength) && seen.Add(trimmed))
             {
                 raw.Add(trimmed);
             }
         }
 
-        Add(endpoint.ApiKey);
-        Add(endpoint.SessionToken?.Token);
-        foreach (var value in endpoint.Headers.Values)
+        Add(endpoint.ApiKey, credential: true);
+        Add(endpoint.SessionToken?.Token, credential: true);
+        bool IsCredentialHeader(string name) =>
+            string.Equals(name, "authorization", StringComparison.OrdinalIgnoreCase)
+                || string.Equals(name, "api-key", StringComparison.OrdinalIgnoreCase)
+                || string.Equals(name, endpoint.SessionToken?.Header, StringComparison.OrdinalIgnoreCase);
+
+        foreach (var header in endpoint.Headers.Concat(headers.Where(header => IsCredentialHeader(header.Key))))
         {
-            Add(value);
-            if (value is not null)
+            var credential = IsCredentialHeader(header.Key);
+            Add(header.Value, credential);
+            if (header.Value is not null)
             {
-                Add(StripBearer(value));
+                Add(StripBearer(header.Value), credential);
             }
         }
 
-        foreach (var value in DecisionsText.QueryValues(url))
+        foreach (var (rawValue, decodedValue) in DecisionsText.QueryValues(endpoint.BaseUrl).Concat(DecisionsText.QueryValues(url)))
         {
-            Add(value);
+            if (DecisionsText.ScalarLength(TrimHttpWhitespace(decodedValue)) >= MinSecretLength)
+            {
+                Add(decodedValue);
+                Add(rawValue);
+            }
         }
 
         var variants = new List<string>();
@@ -580,11 +774,12 @@ internal static class DecisionsText
         return count;
     }
 
-    /// <summary>Values of the URL query, decoded like WHATWG <c>URLSearchParams</c>.</summary>
-    public static IEnumerable<string> QueryValues(string url)
+    /// <summary>Raw query values and their WHATWG <c>URLSearchParams</c>-style decoded forms.</summary>
+    public static IEnumerable<(string Raw, string Decoded)> QueryValues(string url)
     {
         var queryStart = url.IndexOf('?');
-        if (queryStart < 0)
+        var fragmentStart = url.IndexOf('#');
+        if (queryStart < 0 || (fragmentStart >= 0 && fragmentStart < queryStart))
         {
             yield break;
         }
@@ -604,7 +799,8 @@ internal static class DecisionsText
             }
 
             var equals = part.IndexOf('=');
-            yield return equals < 0 ? string.Empty : PercentDecode(part.Substring(equals + 1));
+            var raw = equals < 0 ? string.Empty : part.Substring(equals + 1);
+            yield return (raw, PercentDecode(raw));
         }
     }
 
@@ -704,7 +900,7 @@ internal static class DecisionsText
         return sb.ToString();
     }
 
-    private static bool HasLoneSurrogate(string value)
+    internal static bool HasLoneSurrogate(string value)
     {
         for (var i = 0; i < value.Length; i++)
         {
@@ -822,16 +1018,81 @@ internal static class DecisionsText
         return sb.ToString();
     }
 
-    /// <summary>Replaces every occurrence of any secret variant with <c>[REDACTED]</c>, longest first.</summary>
-    public static string Redact(string text, IReadOnlyList<string> secrets)
+    /// <summary>Redacts the union of overlapping matches against the original text, including self-overlaps.</summary>
+    public static string Redact(string text, IReadOnlyList<string> secrets, int? retainedLength = null, bool includeBoundary = false)
     {
-        var result = text;
+        var limit = retainedLength ?? text.Length;
+        var matchLimit = limit + (includeBoundary ? 1 : 0);
+        var intervals = new List<(int Start, int End)>();
         foreach (var secret in secrets)
         {
-            result = Regex.Replace(result, VariantPattern(secret), "[REDACTED]", RegexOptions.CultureInvariant);
+            if (secret.Length == 0)
+            {
+                continue;
+            }
+
+            foreach (Match match in Regex.Matches(text, "(?=" + VariantPattern(secret) + ")", RegexOptions.CultureInvariant))
+            {
+                if (match.Index >= matchLimit)
+                {
+                    break;
+                }
+
+                intervals.Add((match.Index, match.Index + secret.Length));
+            }
         }
 
-        return result;
+        intervals.Sort((a, b) => a.Start != b.Start ? a.Start.CompareTo(b.Start) : a.End.CompareTo(b.End));
+        var result = new StringBuilder();
+        var cursor = 0;
+        for (var i = 0; i < intervals.Count; i++)
+        {
+            var (start, end) = intervals[i];
+            while (i + 1 < intervals.Count && intervals[i + 1].Start < end)
+            {
+                end = Math.Max(end, intervals[++i].End);
+            }
+
+            result.Append(text, cursor, start - cursor);
+            result.Append("[REDACTED]");
+            cursor = end;
+        }
+
+        if (cursor < limit)
+        {
+            result.Append(text, cursor, limit - cursor);
+        }
+
+        return result.ToString();
+    }
+
+    public static string CapDiagnostic(string text)
+    {
+        var bytes = EncodeUtf8(text);
+        return bytes.Length <= SessionDecisionsApi.MaxErrorBodyBytes
+            ? text
+            : DecodeUtf8(bytes, Utf8BoundaryCut(bytes, SessionDecisionsApi.MaxErrorBodyBytes));
+    }
+
+    public static string RedactPrefix(byte[] bytes, IReadOnlyList<string> secrets)
+    {
+        var cut = Utf8BoundaryCut(bytes, SessionDecisionsApi.MaxErrorBodyBytes);
+        var retained = DecodeUtf8(bytes, cut).Length;
+        var splitCharacter = cut < Math.Min(bytes.Length, SessionDecisionsApi.MaxErrorBodyBytes);
+        return CapDiagnostic(Redact(DecodeUtf8(bytes, bytes.Length), secrets, retained, splitCharacter));
+    }
+
+    public static string RedactDiagnostic(string text, IReadOnlyList<string> secrets)
+    {
+        var bytes = EncodeUtf8(text);
+        var window = (int)Math.Min(bytes.Length, (long)SessionDecisionsApi.MaxErrorBodyBytes + MaxSecretBytes(secrets));
+        var cut = Utf8BoundaryCut(bytes, window);
+        if (cut != bytes.Length)
+        {
+            Array.Resize(ref bytes, cut);
+        }
+
+        return RedactPrefix(bytes, secrets);
     }
 }
 
@@ -898,8 +1159,9 @@ internal static class DecisionsHttp
 
     public static async Task<HttpResponseMessage> SendAsync(HttpClient client, DecisionsAttemptPlan plan, byte[] body, CancellationToken cancellationToken)
     {
+        cancellationToken.ThrowIfCancellationRequested();
         var requestUri = new Uri(plan.Url, UriKind.Absolute);
-        var request = new HttpRequestMessage(HttpMethod.Post, requestUri);
+        using var request = new HttpRequestMessage(HttpMethod.Post, requestUri);
         var content = new ByteArrayContent(body);
         request.Content = content;
         foreach (var header in plan.Headers)
@@ -921,7 +1183,6 @@ internal static class DecisionsHttp
         }
         catch (Exception ex)
         {
-            request.Dispose();
             if (cancellationToken.IsCancellationRequested)
             {
                 if (ex is OperationCanceledException)
@@ -935,11 +1196,16 @@ internal static class DecisionsHttp
             throw NetworkError("The Decisions request could not be sent.", ex, plan.Secrets);
         }
 
+        if (cancellationToken.IsCancellationRequested)
+        {
+            response.Dispose();
+            cancellationToken.ThrowIfCancellationRequested();
+        }
+
         var finalUri = response.RequestMessage?.RequestUri;
         if (finalUri is not null && !string.Equals(finalUri.AbsoluteUri, requestUri.AbsoluteUri, StringComparison.Ordinal))
         {
             response.Dispose();
-            request.Dispose();
             throw new DecisionsException(
                 DecisionsErrorKind.InvalidResponse,
                 "The custom HTTP handler followed a redirect. The Decisions API does not follow redirects.");
@@ -951,6 +1217,8 @@ internal static class DecisionsHttp
     /// <summary>Reads at most <paramref name="limit"/> bytes; <c>exceeded</c> reports whether more data remained.</summary>
     public static async Task<(byte[] Bytes, bool Exceeded)> ReadLimitedAsync(HttpResponseMessage response, int limit, CancellationToken cancellationToken)
     {
+        cancellationToken.ThrowIfCancellationRequested();
+        using var registration = cancellationToken.Register(static state => ((HttpResponseMessage)state!).Dispose(), response);
         if (response.Content is null)
         {
             return ([], false);
@@ -961,8 +1229,10 @@ internal static class DecisionsHttp
         var chunk = new byte[16 * 1024];
         while (true)
         {
+            cancellationToken.ThrowIfCancellationRequested();
             var remaining = limit + 1 - (int)buffer.Length;
             var read = await stream.ReadAsync(chunk.AsMemory(0, Math.Min(chunk.Length, remaining)), cancellationToken).ConfigureAwait(false);
+            cancellationToken.ThrowIfCancellationRequested();
             if (read == 0)
             {
                 return (buffer.ToArray(), false);
@@ -978,19 +1248,14 @@ internal static class DecisionsHttp
         }
     }
 
-    public static async Task<DecisionsException> CreateHttpErrorAsync(HttpResponseMessage response, IReadOnlyList<string> secrets, CancellationToken cancellationToken)
+    public static async Task<DecisionsException> CreateHttpErrorAsync(
+        HttpResponseMessage response, IReadOnlyList<string> secrets, CancellationToken cancellationToken, DateTimeOffset? now = null)
     {
-        var window = SessionDecisionsApi.MaxErrorBodyBytes + DecisionsText.MaxSecretBytes(secrets);
+        var window = (int)Math.Min(int.MaxValue - 1, (long)SessionDecisionsApi.MaxErrorBodyBytes + DecisionsText.MaxSecretBytes(secrets));
         var (bytes, exceeded) = await ReadLimitedAsync(response, window, cancellationToken).ConfigureAwait(false);
         var raw = DecisionsText.DecodeUtf8(bytes, bytes.Length);
-        var body = DecisionsText.Redact(raw, secrets);
+        var body = DecisionsText.RedactPrefix(bytes, secrets);
         var truncated = exceeded || bytes.Length > SessionDecisionsApi.MaxErrorBodyBytes;
-        // Cut even when not truncated: replacing short secrets with "[REDACTED]" can grow the text.
-        var encoded = DecisionsText.EncodeUtf8(body);
-        if (encoded.Length > SessionDecisionsApi.MaxErrorBodyBytes)
-        {
-            body = DecisionsText.DecodeUtf8(encoded, DecisionsText.Utf8BoundaryCut(encoded, SessionDecisionsApi.MaxErrorBodyBytes));
-        }
 
         string? errorType = null, errorCode = null, errorParam = null, errorMessage = null;
         if (!truncated)
@@ -1021,16 +1286,92 @@ internal static class DecisionsHttp
         var message = string.IsNullOrEmpty(errorMessage)
             ? $"Decisions request failed with {statusText}."
             : $"Decisions request failed with {statusText}: {errorMessage}";
-        return new DecisionsException(DecisionsErrorKind.Http, message)
+        var requestId = Header(response, "x-request-id");
+        return new DecisionsException(DecisionsErrorKind.Http, DecisionsText.CapDiagnostic(message))
         {
             Status = status,
             ErrorType = errorType,
             ErrorCode = errorCode,
             ErrorParam = errorParam,
-            RequestId = response.Headers.TryGetValues("x-request-id", out var ids) ? string.Join(", ", ids) : null,
+            RequestId = requestId is null ? null : DecisionsText.RedactDiagnostic(requestId, secrets),
+            RetryAfterMs = ParseRetryAfterMs(Header(response, "retry-after-ms"), Header(response, "retry-after"), now ?? DateTimeOffset.UtcNow),
             Body = body,
             BodyTruncated = truncated,
         };
+    }
+
+    private static string? Header(HttpResponseMessage response, string name) =>
+        response.Headers.TryGetValues(name, out var values) ? string.Join(", ", values) : null;
+
+    internal static long? ParseRetryAfterMs(string? milliseconds, string? retryAfter, DateTimeOffset now)
+    {
+        if (ParseDelay(milliseconds, 1) is { } preferred)
+        {
+            return preferred;
+        }
+
+        if (ParseDelay(retryAfter, 1000) is { } seconds)
+        {
+            return seconds;
+        }
+
+        if (retryAfter is null)
+        {
+            return null;
+        }
+
+        var text = DecisionsPlanner.TrimHttpWhitespace(retryAfter);
+        const string Format = "ddd, dd MMM yyyy HH:mm:ss 'GMT'";
+        if (!DateTimeOffset.TryParseExact(text, Format, CultureInfo.InvariantCulture,
+            DateTimeStyles.AssumeUniversal | DateTimeStyles.AdjustToUniversal, out var date)
+            || !string.Equals(date.ToString(Format, CultureInfo.InvariantCulture), text, StringComparison.Ordinal))
+        {
+            return null;
+        }
+
+        var ticks = date.UtcDateTime.Ticks - now.UtcDateTime.Ticks;
+        return ticks <= 0 ? 0 : ((ticks - 1) / TimeSpan.TicksPerMillisecond) + 1;
+    }
+
+    private static long? ParseDelay(string? value, int multiplier)
+    {
+        if (value is null)
+        {
+            return null;
+        }
+
+        var text = DecisionsPlanner.TrimHttpWhitespace(value);
+        var dot = text.IndexOf('.');
+        if (text.Length == 0 || dot == 0 || dot == text.Length - 1
+            || text.Where((c, i) => i != dot).Any(c => c is < '0' or > '9'))
+        {
+            return null;
+        }
+
+        var whole = dot < 0 ? text : text.Substring(0, dot);
+        if (!long.TryParse(whole, NumberStyles.None, CultureInfo.InvariantCulture, out var integer))
+        {
+            return null;
+        }
+
+        var fraction = dot < 0 ? string.Empty : text.Substring(dot + 1);
+        long extra = 0;
+        var consumed = multiplier == 1000 ? Math.Min(3, fraction.Length) : 0;
+        if (multiplier == 1000)
+        {
+            for (var i = 0; i < 3; i++)
+            {
+                extra = (extra * 10) + (i < fraction.Length ? fraction[i] - '0' : 0);
+            }
+        }
+
+        if (fraction.Skip(consumed).Any(c => c != '0'))
+        {
+            extra++;
+        }
+
+        const long Maximum = 9007199254740991;
+        return integer <= (Maximum - extra) / multiplier ? (integer * multiplier) + extra : null;
     }
 
     private static string? RedactField(JsonElement error, string name, IReadOnlyList<string> secrets)
@@ -1048,15 +1389,14 @@ internal static class DecisionsHttp
             JsonValueKind.False => "false",
             _ => null,
         };
-        return text is null ? null : DecisionsText.Redact(text, secrets);
+        return text is null ? null : DecisionsText.RedactDiagnostic(text, secrets);
     }
 
     public static DecisionsException NetworkError(string message, Exception error, IReadOnlyList<string> secrets) =>
         new(DecisionsErrorKind.Network, message, Sanitize(error, secrets));
 
     /// <summary>
-    /// Builds a credential-free stand-in for a transport exception: only the type name, a string code, and the
-    /// redacted message are retained.
+    /// Retains only bounded, redacted type-name, message, and code strings, not the original exception graph.
     /// </summary>
     private static DecisionsTransportException Sanitize(Exception error, IReadOnlyList<string> secrets)
     {
@@ -1084,9 +1424,9 @@ internal static class DecisionsHttp
 #endif
 
         return new DecisionsTransportException(
-            error.GetType().FullName ?? error.GetType().Name,
-            DecisionsText.Redact(error.Message, secrets),
-            code);
+            DecisionsText.RedactDiagnostic(error.GetType().FullName ?? error.GetType().Name, secrets),
+            DecisionsText.RedactDiagnostic(error.Message, secrets),
+            code is null ? null : DecisionsText.RedactDiagnostic(code, secrets));
     }
 }
 
@@ -1176,11 +1516,38 @@ internal static class DecisionsWire
         writer.WriteEndObject();
     }
 
-    private static void WritePart(Utf8JsonWriter writer, DecisionsContentPart part)
+    private enum ContentContext
+    {
+        User,
+        Instruction,
+        Assistant,
+        ToolOutput,
+        Question,
+    }
+
+    private static void WritePart(Utf8JsonWriter writer, DecisionsContentPart part, ContentContext context)
     {
         if (part is null)
         {
             throw new ArgumentException("Decisions content parts must not be null.");
+        }
+
+        var allowed = context switch
+        {
+            ContentContext.User or ContentContext.Question => part is DecisionsInputText or DecisionsInputImage or DecisionsInputJson,
+            ContentContext.Instruction => part is DecisionsInputText,
+            ContentContext.Assistant => part is DecisionsOutputText or DecisionsRefusalContent,
+            _ => part is DecisionsInputText or DecisionsInputImage,
+        };
+        if (!allowed)
+        {
+            throw new ArgumentException("The Decisions content part is not supported in this message role or question.");
+        }
+
+        if (part is DecisionsInputText { Text: null } or DecisionsInputImage { ImageUrl: null }
+            or DecisionsOutputText { Text: null } or DecisionsRefusalContent { Refusal: null })
+        {
+            throw new ArgumentException("Decisions content part text and image URLs must not be null.");
         }
 
         writer.WriteStartObject();
@@ -1189,14 +1556,28 @@ internal static class DecisionsWire
         {
             case DecisionsInputText text:
                 writer.WriteString("text", text.Text);
-                WriteBreakpoint(writer, text.PromptCacheBreakpoint);
+                if (context != ContentContext.Question)
+                {
+                    WriteBreakpoint(writer, text.PromptCacheBreakpoint);
+                }
+
                 break;
             case DecisionsInputImage image:
                 writer.WriteString("image_url", image.ImageUrl);
                 WriteIfPresent(writer, "detail", image.Detail);
-                WriteBreakpoint(writer, image.PromptCacheBreakpoint);
+                if (context != ContentContext.Question)
+                {
+                    WriteBreakpoint(writer, image.PromptCacheBreakpoint);
+                }
+
                 break;
             case DecisionsInputJson json:
+                if (json.Data.ValueKind != JsonValueKind.Object
+                    && (json.Data.ValueKind != JsonValueKind.Array || json.Data.EnumerateArray().Any(item => item.ValueKind != JsonValueKind.Object)))
+                {
+                    throw new ArgumentException("DecisionsInputJson.Data must be an object or an array of objects.");
+                }
+
                 writer.WritePropertyName("data");
                 WriteRaw(writer, json.Data, "DecisionsInputJson.Data");
                 break;
@@ -1211,7 +1592,7 @@ internal static class DecisionsWire
         writer.WriteEndObject();
     }
 
-    private static void WriteContent(Utf8JsonWriter writer, string name, DecisionsContent? content, string what)
+    private static void WriteContent(Utf8JsonWriter writer, string name, DecisionsContent? content, string what, ContentContext context)
     {
         if (content is null)
         {
@@ -1228,7 +1609,7 @@ internal static class DecisionsWire
         writer.WriteStartArray();
         foreach (var part in content.Parts!)
         {
-            WritePart(writer, part);
+            WritePart(writer, part, context);
         }
 
         writer.WriteEndArray();
@@ -1242,6 +1623,13 @@ internal static class DecisionsWire
                 WriteRaw(writer, raw.Raw, "DecisionsRawInputItem.Raw");
                 return;
             case DecisionsMessage message:
+                var context = message.Role switch
+                {
+                    "user" => ContentContext.User,
+                    "developer" or "system" => ContentContext.Instruction,
+                    "assistant" => ContentContext.Assistant,
+                    _ => throw new ArgumentException("DecisionsMessage.Role must be user, developer, system, or assistant."),
+                };
                 writer.WriteStartObject();
                 if (!message.OmitType)
                 {
@@ -1249,7 +1637,7 @@ internal static class DecisionsWire
                 }
 
                 writer.WriteString("role", message.Role);
-                WriteContent(writer, "content", message.Content, "DecisionsMessage.Content");
+                WriteContent(writer, "content", message.Content, "DecisionsMessage.Content", context);
                 if (string.Equals(message.Role, "assistant", StringComparison.Ordinal))
                 {
                     WriteIfPresent(writer, "phase", message.Phase);
@@ -1295,7 +1683,7 @@ internal static class DecisionsWire
         writer.WriteStartObject();
         writer.WriteString("type", type);
         writer.WriteString("call_id", callId);
-        WriteContent(writer, "output", output, "Tool call output");
+        WriteContent(writer, "output", output, "Tool call output", ContentContext.ToolOutput);
         WriteIfPresent(writer, "id", id);
         WriteIfPresent(writer, "status", status);
         writer.WriteEndObject();
@@ -1311,13 +1699,18 @@ internal static class DecisionsWire
         writer.WriteStartObject();
         writer.WriteString("type", question.Type);
         WriteIfPresent(writer, "name", question.Name);
-        WriteContent(writer, "instructions", question.Instructions, "DecisionsQuestion.Instructions");
+        WriteContent(writer, "instructions", question.Instructions, "DecisionsQuestion.Instructions", ContentContext.Question);
         switch (question)
         {
             case DecisionsChoiceQuestion choice:
                 writer.WriteStartArray("choices");
                 foreach (var option in choice.Choices)
                 {
+                    if (option is null)
+                    {
+                        throw new ArgumentException("Decisions choice options must not be null.");
+                    }
+
                     writer.WriteStartObject();
                     writer.WritePropertyName("value");
                     if (option.Value.IsBoolean)
@@ -1339,6 +1732,11 @@ internal static class DecisionsWire
                 writer.WriteStartArray("levels");
                 foreach (var level in score.Levels)
                 {
+                    if (level is null)
+                    {
+                        throw new ArgumentException("Decisions score levels must not be null.");
+                    }
+
                     writer.WriteStartObject();
                     writer.WriteString("label", level.Label);
                     WriteIfPresent(writer, "description", level.Description);
@@ -1409,18 +1807,86 @@ internal static class DecisionsWire
 
     private static long OptionalCount(JsonElement? obj, string key)
     {
-        if (obj is not { } o || !o.TryGetProperty(key, out var value) || value.ValueKind == JsonValueKind.Null)
+        if (obj is not { } o || !o.TryGetProperty(key, out _))
         {
             return 0;
         }
 
-        var number = Num(o, key);
-        if (Math.Floor(number) != number || number < long.MinValue || number >= 9.2233720368547758E18)
+        return Integer(o, key);
+    }
+
+    private static long Integer(JsonElement obj, string key)
+    {
+        if (obj.TryGetProperty(key, out var value) && value.ValueKind == JsonValueKind.Number)
         {
-            throw new InvalidResponseException($"Expected integer '{key}'.");
+            if (value.TryGetInt64(out var integer))
+            {
+                return integer;
+            }
+
+            var raw = value.GetRawText();
+            var exponentAt = raw.IndexOfAny(['e', 'E']);
+            if (raw.AsSpan().IndexOf('.') >= 0 || exponentAt >= 0)
+            {
+                var negative = raw[0] == '-';
+                var mantissaEnd = exponentAt < 0 ? raw.Length : exponentAt;
+                var mantissa = raw.Substring(negative ? 1 : 0, mantissaEnd - (negative ? 1 : 0));
+                var point = mantissa.IndexOf('.');
+                var digits = mantissa.Replace(".", string.Empty);
+                var first = 0;
+                while (first < digits.Length && digits[first] == '0')
+                {
+                    first++;
+                }
+
+                if (first == digits.Length)
+                {
+                    return 0;
+                }
+
+                var exponent = 0;
+                if (exponentAt >= 0 &&
+#if NET
+                    !int.TryParse(raw.AsSpan(exponentAt + 1), NumberStyles.AllowLeadingSign, CultureInfo.InvariantCulture, out exponent))
+#else
+                    !int.TryParse(raw.Substring(exponentAt + 1), NumberStyles.AllowLeadingSign, CultureInfo.InvariantCulture, out exponent))
+#endif
+                {
+                    throw new InvalidResponseException($"Expected integer '{key}'.");
+                }
+
+                var last = digits.Length - 1;
+                while (digits[last] == '0')
+                {
+                    last--;
+                }
+
+                var decimalPoint = (long)(point < 0 ? digits.Length : point) + exponent;
+                if (last < decimalPoint && decimalPoint - first is > 0 and <= 16)
+                {
+                    var significant = new StringBuilder(16).Append(digits, first, last - first + 1)
+                        .Append('0', (int)(decimalPoint - last - 1)).ToString();
+                    if (long.TryParse(significant, NumberStyles.None, CultureInfo.InvariantCulture, out integer)
+                        && integer <= 9007199254740991)
+                    {
+                        return negative ? -integer : integer;
+                    }
+                }
+            }
         }
 
-        return (long)number;
+        throw new InvalidResponseException($"Expected signed 64-bit integer '{key}'.");
+    }
+
+    private static double Probability(JsonElement obj, string key)
+    {
+        var number = Num(obj, key);
+        if (number is < 0 or > 1)
+        {
+            throw new InvalidResponseException($"Expected probability '{key}' between zero and one.");
+        }
+
+        return number;
     }
 
     private static string Str(JsonElement obj, string key)
@@ -1484,16 +1950,16 @@ internal static class DecisionsWire
         switch (type)
         {
             case "predicate":
-                return new DecisionsPredicateAnswer(name, Num(obj, "probability"));
+                return new DecisionsPredicateAnswer(name, Probability(obj, "probability"));
             case "choice":
                 {
                     var choice = ChoiceValue(obj, "choice");
-                    var confidence = Num(obj, "confidence");
+                    var confidence = Probability(obj, "confidence");
                     var probabilities = ObjectArray(obj, "probabilities")
                         .Select(p =>
                         {
                             var value = ChoiceValue(p, "value");
-                            return new DecisionsChoiceProbability(value, Num(p, "probability"));
+                            return new DecisionsChoiceProbability(value, Probability(p, "probability"));
                         })
                         .ToArray();
                     return new DecisionsChoiceAnswer(name, choice, confidence, probabilities);
@@ -1502,18 +1968,13 @@ internal static class DecisionsWire
             case "score":
                 {
                     var score = Num(obj, "score");
-                    var confidence = Num(obj, "confidence");
+                    var confidence = Probability(obj, "confidence");
                     var probabilities = ObjectArray(obj, "probabilities")
                         .Select(p =>
                         {
-                            var value = Num(p, "value");
-                            if (Math.Floor(value) != value || value < int.MinValue || value > int.MaxValue)
-                            {
-                                throw new InvalidResponseException("Expected integer level 'value'.");
-                            }
-
+                            var value = Integer(p, "value");
                             var label = Str(p, "label");
-                            return new DecisionsScoreProbability(label, (int)value, Num(p, "probability"));
+                            return new DecisionsScoreProbability(label, value, Probability(p, "probability"));
                         })
                         .ToArray();
                     return new DecisionsScoreAnswer(name, score, confidence, probabilities);

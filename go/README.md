@@ -33,6 +33,63 @@ The manual permission/tool-result resume sample can be run from the same directo
 go run ./manual_tool_resume
 ```
 
+## Experimental Decisions API
+
+`session.Decisions().Create` resolves the session's provider endpoint using the existing
+runtime RPC, then sends a typed request directly to its OpenAI-compatible HTTP endpoint.
+It does not send an agent turn or automatically include conversation history. Enable
+`COPILOT_ALLOW_GET_PROVIDER_ENDPOINT=true` in the runtime environment to permit endpoint
+resolution. The extension remains experimental; fixture/local-server tests do not
+establish live-provider compatibility.
+
+```go
+timeout := 30 * time.Second
+result, err := session.Decisions().Create(ctx, copilot.DecisionsRequest{
+    Model: "your-decisions-model",
+    Input: "The export button does nothing.",
+    Questions: []copilot.DecisionsQuestion{
+        copilot.DecisionsPredicateQuestion{
+            Name: copilot.String("is_bug"),
+            Instructions: "Is this a product defect?",
+        },
+    },
+}, &copilot.DecisionsOptions{Timeout: &timeout})
+```
+
+Import `time` alongside the SDK. A nil `Timeout` (including nil options) supplies a
+**600-second total-call deadline**, covering endpoint resolution, both possible HTTP
+attempts, and response bodies. A pointer to zero disables the SDK deadline; negative
+durations are argument errors. SDK expiry returns `DecisionsErrorKindTimeout` with no
+underlying provider error. Caller context cancellation/deadlines stay native and take
+precedence. Custom transports must honor the request context, allow response-body `Close`
+concurrently with `Read`, and enforce their own TLS and internal redirect policy.
+
+The built-in client does not follow redirects. It permits only one conditional replay:
+after a readable 401/403, the refreshed endpoint must have a changed effective URL or
+credential. Unreadable authentication responses do not refresh or replay. Network,
+429, and 5xx failures are not retried. HTTP errors may include advisory `RetryAfterMS`;
+the SDK does not sleep or retry because of this hint.
+
+Diagnostics protect known credentials of every nonempty length, including old credentials
+after a refresh and supported literal/JSON/percent/form representations. Other endpoint
+header and query values use an eight-Unicode-scalar heuristic. This is not general PII
+redaction or a guarantee against arbitrary transformations. Error bodies retain at most
+the original first 64 KiB, with bounded lookahead only to redact boundary-crossing
+credentials; diagnostic output is also capped at 64 KiB. Raw provider exceptions are
+not retained. Success bodies are limited to 8 MiB.
+
+Scalar scores remain fractional. Score-probability indices and usage counters are signed
+64-bit integers (including provider sentinels); missing counts default to zero. Present
+fractional, null, boolean, string, and out-of-range counts are invalid responses. Plain
+JSON integer tokens preserve the full int64 range; integral decimal/exponent encodings
+are accepted only within the portable safe-integer range.
+
+Run the offline Decisions fixture, injected-transport, RPC-pipe, and local-HTTP checks with
+`go test -p 2 -run Decisions -count=1 ./...`; these checks need neither the runtime CLI
+nor live credentials. Set `COPILOT_DECISIONS_VECTOR_CENSUS` to a JSON file in an existing
+directory to record shared cases only after their assertions pass. A census is meaningful
+only alongside a successful test-runner exit.
+
 ## Quick Start
 
 For experimental in-process AHP hosting, use `client.StartAhpHost(ctx, &copilot.AhpHostOptions{...})`.

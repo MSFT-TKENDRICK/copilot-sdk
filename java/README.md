@@ -74,6 +74,56 @@ Snapshot builds of the next development version are published to Maven Central S
 implementation 'com.github:copilot-sdk-java:1.0.15-preview.1-SNAPSHOT'
 ```
 
+## Decisions (experimental fork)
+
+`session.getDecisions().create(request, options)` resolves the session's provider
+endpoint and sends a direct HTTP Decisions request. It does not run an agent
+turn or implicitly include session history. The runtime must enable
+`COPILOT_ALLOW_GET_PROVIDER_ENDPOINT=true`; the request's model is required,
+independently of `DecisionsOptions.setEndpointModelId(...)`.
+
+```java
+var request = new DecisionsRequest()
+    .setModel("gpt-6-luna")
+    .setInput("The export button does nothing.")
+    .setQuestions(List.of(new DecisionsQuestion.Predicate("is_bug", "Is this a product defect?")));
+var pending = session.getDecisions().create(
+    request, new DecisionsOptions().setTimeout(Duration.ofSeconds(30)));
+```
+
+- The default **600-second total-call deadline** covers endpoint resolution,
+  HTTP headers, response bodies, and authentication refresh. `Duration.ZERO`
+  disables it; `null` restores the default, and negative durations are invalid.
+  SDK expiry produces `DecisionsErrorKind.TIMEOUT` without a raw cause.
+  Cancelling the returned future keeps native `CancellationException` semantics,
+  cancels in-flight HTTP work, and closes acquired response streams. A pending
+  endpoint RPC cannot be cancelled by this protocol, but its late completion
+  cannot dispatch HTTP. Injected transports must cooperate with cancellation
+  and unblock body readers when their streams close.
+- Only a fully read 401/403 response can trigger one credential refresh and one
+  replay, and only if the effective URL or credentials changed. There is no
+  automatic network, rate-limit, or server-error retry. HTTP errors expose
+  optional `getRetryAfterMs()` guidance; it is advisory.
+- HTTP error bodies retain only their original first 64 KiB of UTF-8, with
+  lookahead used solely to recognize crossing credentials. Known nonempty
+  authentication credentials and supported escaped forms are redacted from
+  bodies, error fields, request IDs, and sanitized transport causes. Other
+  endpoint header/query values use an eight-Unicode-scalar heuristic. This is
+  not general PII removal or protection against arbitrary transformations.
+  Endpoint RPC exceptions are replaced with fixed safe diagnostics.
+- URLs require an explicit HTTP(S) authority and encoded non-ASCII components;
+  local HTTP and bracketed IPv6 are supported. The built-in client never follows
+  redirects. Injected clients must report `Redirect.NEVER` and remain responsible
+  for honoring that policy and configuring TLS.
+- Question instructions accept text, images, and JSON, and omit input-only cache
+  breakpoints. User input messages also support JSON. Only the `30m`
+  cache TTL is documented. Usage counters and score-level indices preserve
+  signed 64-bit integers; fractional expected scores remain fractional.
+
+Local fixture and loopback HTTP tests do not establish live-provider
+compatibility. See the [Decisions guide](../docs/features/decisions.md) for the
+experimental API's scope.
+
 ## In-process mode (experimental)
 
 The SDK supports running the Copilot runtime **in-process** as a native library instead of spawning a separate CLI process. This eliminates process management overhead and simplifies deployment. In-process mode is currently experimental and supported on **linux-x64** (glibc), **linux-arm64** (glibc), **linuxmusl-x64**, **linuxmusl-arm64**, **win32-x64**, **win32-arm64**, **darwin-x64**, and **darwin-arm64**.

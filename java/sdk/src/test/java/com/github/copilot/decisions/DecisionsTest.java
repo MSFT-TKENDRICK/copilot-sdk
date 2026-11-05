@@ -24,11 +24,13 @@ import java.net.InetAddress;
 import java.net.ProxySelector;
 import java.net.ServerSocket;
 import java.net.Socket;
+import java.net.SocketException;
 import java.net.URI;
 import java.net.http.HttpClient;
 import java.net.http.HttpHeaders;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
+import java.net.http.HttpTimeoutException;
 import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
@@ -62,13 +64,17 @@ import javax.net.ssl.SSLParameters;
 import javax.net.ssl.SSLSession;
 
 import org.junit.jupiter.api.DynamicTest;
+import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.TestFactory;
+import org.junit.jupiter.api.function.Executable;
 
 import com.fasterxml.jackson.databind.DeserializationFeature;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ObjectNode;
+import com.fasterxml.jackson.databind.node.ArrayNode;
+import com.fasterxml.jackson.databind.util.RawValue;
 import com.fasterxml.jackson.datatype.jsr310.JavaTimeModule;
 import com.github.copilot.decisions.DecisionsContentPart.InputImage;
 import com.github.copilot.decisions.DecisionsContentPart.InputJson;
@@ -100,6 +106,8 @@ class DecisionsTest {
             .disable(DeserializationFeature.FAIL_ON_UNKNOWN_PROPERTIES);
     private static final Path FIXTURE_DIR = findFixtureDir();
     private static final JsonNode VECTORS = fixture("vectors.json");
+    private static final JsonNode PRODUCTION_VECTORS = fixture("production-vectors.json");
+    private static final List<ObjectNode> PASSED_VECTORS = Collections.synchronizedList(new ArrayList<>());
     private static final String OK_BODY = fixture("response.full.json").toString();
     private static final long TIMEOUT_SECONDS = 20;
 
@@ -425,6 +433,7 @@ class DecisionsTest {
     /** A stream that records reads and closes. */
     static class TrackingStream extends InputStream {
         final AtomicBoolean closed = new AtomicBoolean();
+        final CountDownLatch closedLatch = new CountDownLatch(1);
 
         @Override
         public int read() throws IOException {
@@ -436,6 +445,7 @@ class DecisionsTest {
         @Override
         public void close() {
             closed.set(true);
+            closedLatch.countDown();
         }
     }
 
@@ -483,6 +493,7 @@ class DecisionsTest {
     /** A stream that blocks until closed. */
     static final class BlockingStream extends TrackingStream {
         final CountDownLatch reading = new CountDownLatch(1);
+        final CountDownLatch finished = new CountDownLatch(1);
         private final CountDownLatch release = new CountDownLatch(1);
 
         @Override
@@ -492,6 +503,8 @@ class DecisionsTest {
                 release.await(TIMEOUT_SECONDS, TimeUnit.SECONDS);
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
+            } finally {
+                finished.countDown();
             }
             throw new IOException("closed");
         }
@@ -509,6 +522,17 @@ class DecisionsTest {
     @Test
     void serializesFullRequestToGoldenFixture() {
         assertEquals(fixture("request.full.json"), DecisionsWire.serialize(fullRequest()));
+    }
+
+    @Test
+    void preservesQuestionJsonThroughPublicApi() throws Exception {
+        DecisionsQuestion question = new DecisionsQuestion.Predicate(DecisionsContent.<QuestionPart>of(
+                new InputJson(fixture("request.full.json").at("/questions/2/instructions/2/data"))), null);
+        FakeClient client = client(respond(200, OK_BODY));
+        await(decisionsWith(OPENAI).create(minimalRequest().setQuestions(List.of(question)), with(client)));
+        assertEquals(fixture("request.full.json").at("/questions/2/instructions/2"),
+                json(client.calls.get(0).body()).at("/questions/0/instructions/0"));
+        assertEquals(1, client.calls.size());
     }
 
     @Test
@@ -548,6 +572,53 @@ class DecisionsTest {
         JsonNode wire = DecisionsWire.serialize(fullRequest());
         assertTrue(wire.at("/questions/2/choices/0/value").isBoolean());
         assertTrue(wire.at("/questions/1/choices/0/value").isTextual());
+    }
+
+    @Test
+    void omitsQuestionCacheBreakpointsButPreservesInputBreakpoints() throws Exception {
+        InputText text = new InputText("synthetic instruction", DecisionsCacheBreakpoint.explicit());
+        InputImage image = new InputImage("https://example.com/synthetic.png", "auto",
+                DecisionsCacheBreakpoint.explicit());
+        DecisionsContent<QuestionPart> instructions = DecisionsContent.of(text, image);
+        DecisionsRequest request = minimalRequest().setInput(List.of(new UserMessage(DecisionsContent.of(text, image))))
+                .setQuestions(List.of(new DecisionsQuestion.Predicate(instructions, "predicate"),
+                        new DecisionsQuestion.Choice(instructions, "choice", List.of(new ChoiceOption("yes"))),
+                        new DecisionsQuestion.Score(instructions, "score", List.of(new ScoreLevel("low")))));
+        FakeClient client = client(respond(200, OK_BODY));
+        await(decisionsWith(OPENAI).create(request, with(client)));
+        JsonNode sent = json(client.calls.get(0).body());
+        assertTrue(sent.at("/input/0/content/0").has("prompt_cache_breakpoint"));
+        assertTrue(sent.at("/input/0/content/1").has("prompt_cache_breakpoint"));
+        for (JsonNode question : sent.get("questions")) {
+            assertEquals(2, question.get("instructions").size());
+            for (JsonNode part : question.get("instructions")) {
+                assertFalse(part.has("prompt_cache_breakpoint"));
+            }
+        }
+        assertNotNull(text.promptCacheBreakpoint());
+        assertNotNull(image.promptCacheBreakpoint());
+    }
+
+    @SuppressWarnings({"rawtypes", "unchecked"})
+    @Test
+    void rejectsInvalidRolePartCombinationsEvenThroughRawGenerics() throws Exception {
+        DecisionsContent assistantText = DecisionsContent.of(new OutputText("synthetic output"));
+        DecisionsContent inputText = DecisionsContent.of(new InputText("synthetic input"));
+        DecisionsContent image = DecisionsContent.of(new InputImage("https://example.com/synthetic.png"));
+        DecisionsContent data = DecisionsContent.of(new InputJson(json("{\"synthetic\":true}")));
+        List<DecisionsInputItem> invalid = List.of(new UserMessage(assistantText),
+                new DeveloperMessage("developer", image), new AssistantMessage(inputText),
+                new FunctionCallOutput("synthetic-call", data));
+        FakeClient client = client(respond(200, OK_BODY));
+        for (DecisionsInputItem item : invalid) {
+            assertInstanceOf(IllegalArgumentException.class,
+                    failure(decisionsWith(OPENAI).create(minimalRequest().setInput(List.of(item)), with(client))));
+        }
+        DecisionsQuestion question = new DecisionsQuestion.Predicate(assistantText, "synthetic");
+        assertInstanceOf(IllegalArgumentException.class,
+                failure(decisionsWith(OPENAI).create(minimalRequest().setQuestions(List.of(question)), with(client))));
+        assertEquals(0, client.calls.size());
+        assertThrows(IllegalArgumentException.class, () -> new DeveloperMessage("synthetic-invalid-role", "text"));
     }
 
     // ----------------------------------------------------------------- parsing
@@ -600,15 +671,97 @@ class DecisionsTest {
         }
     }
 
+    @Test
+    void enforcesExactSignedIntegerDomainsAcrossAllUsageFields() throws Exception {
+        List<String> targets = List.of("usage.input_tokens", "usage.output_tokens", "usage.total_tokens",
+                "usage.input_tokens_details.cached_tokens", "usage.input_tokens_details.cache_write_tokens",
+                "usage.output_tokens_details.reasoning_tokens", "answers.3.probabilities.0.value");
+        List<String> invalid = List.of("null", "true", "\"3\"", "0.25", "3.0000000000000001", "9223372036854775808",
+                "-9223372036854775809", "9007199254740992.0", "1e400", "9223372036854775807.0");
+        for (String target : targets) {
+            for (String raw : invalid) {
+                FakeClient client = client(respond(200, responseWithValue(target, raw)));
+                DecisionsException error = decisionsFailure(
+                        decisionsWith(OPENAI).create(minimalRequest(), with(client)));
+                assertEquals(DecisionsErrorKind.INVALID_RESPONSE, error.getKind(), target + " = " + raw);
+                assertNull(error.getCause());
+            }
+        }
+        for (String value : List.of("-9223372036854775808", "9223372036854775807", "9007199254740991.0", "-3e0")) {
+            FakeClient client = client(respond(200, responseWithValue("answers.3.probabilities.0.value", value)));
+            long expected = new java.math.BigDecimal(value).longValueExact();
+            DecisionsAnswer.Score score = (DecisionsAnswer.Score) await(
+                    decisionsWith(OPENAI).create(minimalRequest(), with(client))).answers().get(3);
+            assertEquals(expected, score.probabilities().get(0).value());
+        }
+    }
+
+    @Test
+    void knownFloatingFieldsRejectInvalidAndNonfiniteNumbers() throws Exception {
+        for (String target : List.of("answers.0.probability", "answers.1.confidence",
+                "answers.1.probabilities.0.probability", "answers.3.score", "answers.3.confidence",
+                "answers.3.probabilities.0.probability")) {
+            for (String raw : List.of("null", "true", "\"1\"", "1e400", "-1e400")) {
+                FakeClient client = client(respond(200, responseWithValue(target, raw)));
+                assertEquals(DecisionsErrorKind.INVALID_RESPONSE,
+                        decisionsFailure(decisionsWith(OPENAI).create(minimalRequest(), with(client))).getKind(),
+                        target + " = " + raw);
+            }
+        }
+        for (String raw : List.of("-0.1", "1.1")) {
+            FakeClient client = client(respond(200, responseWithValue("answers.0.probability", raw)));
+            assertEquals(DecisionsErrorKind.INVALID_RESPONSE,
+                    decisionsFailure(decisionsWith(OPENAI).create(minimalRequest(), with(client))).getKind());
+        }
+    }
+
+    @Test
+    void missingUsageCountersDefaultToZeroAndBomSuccessParses() throws Exception {
+        FakeClient client = client(respond(200, "\uFEFF{\"answers\":[],\"model\":\"synthetic\",\"usage\":{}}"));
+        DecisionsUsage usage = await(decisionsWith(OPENAI).create(minimalRequest(), with(client))).usage();
+        assertEquals(new DecisionsUsage(0, new DecisionsUsage.InputTokensDetails(0, 0), 0,
+                new DecisionsUsage.OutputTokensDetails(0), 0), usage);
+    }
+
     // ----------------------------------------------------------------- vectors
 
     private static Stream<JsonNode> group(String name) {
-        JsonNode array = VECTORS.get(name);
+        return group(VECTORS, name);
+    }
+
+    private static Stream<JsonNode> group(JsonNode source, String name) {
+        JsonNode array = source.get(name);
         assertNotNull(array, name);
         assertTrue(array.size() > 0, name);
         List<JsonNode> out = new ArrayList<>();
         array.forEach(out::add);
         return out.stream();
+    }
+
+    private static DynamicTest vector(String file, String group, JsonNode value, Executable assertions) {
+        return DynamicTest.dynamicTest(value.get("name").asText(), () -> {
+            assertions.execute();
+            ObjectNode passed = MAPPER.createObjectNode();
+            passed.put("file", file).put("group", group).put("name", value.get("name").asText()).put("status",
+                    "passed");
+            PASSED_VECTORS.add(passed);
+        });
+    }
+
+    @AfterAll
+    static void writeVectorCensus() throws IOException {
+        String destination = System.getenv("COPILOT_DECISIONS_VECTOR_CENSUS");
+        if (destination == null || destination.isEmpty()) {
+            return;
+        }
+        Path path = Path.of(destination);
+        if (path.toAbsolutePath().getParent() != null) {
+            Files.createDirectories(path.toAbsolutePath().getParent());
+        }
+        ObjectNode census = MAPPER.createObjectNode().put("sdk", "java").put("schemaVersion", 1);
+        ArrayNode cases = census.putArray("cases");
+        PASSED_VECTORS.forEach(cases::add);
+        MAPPER.writerWithDefaultPrettyPrinter().writeValue(path.toFile(), census);
     }
 
     private static Map<String, String> stringMap(JsonNode node) {
@@ -623,7 +776,7 @@ class DecisionsTest {
 
     @TestFactory
     Stream<DynamicTest> urlVectors() {
-        return group("url").map(v -> DynamicTest.dynamicTest(v.get("name").asText(), () -> {
+        return group("url").map(v -> vector("vectors.json", "url", v, () -> {
             SessionProviderGetEndpointResult ep = endpoint(v.get("endpoint"));
             if (v.hasNonNull("error")) {
                 DecisionsException error = assertThrows(DecisionsException.class,
@@ -638,7 +791,7 @@ class DecisionsTest {
 
     @TestFactory
     Stream<DynamicTest> headerVectors() {
-        return group("headers").map(v -> DynamicTest.dynamicTest(v.get("name").asText(), () -> {
+        return group("headers").map(v -> vector("vectors.json", "headers", v, () -> {
             SessionProviderGetEndpointResult ep = endpoint(v.get("endpoint"));
             if (v.hasNonNull("error")) {
                 DecisionsException error = assertThrows(DecisionsException.class,
@@ -654,7 +807,7 @@ class DecisionsTest {
 
     @TestFactory
     Stream<DynamicTest> preflightVectors() {
-        return group("preflight").map(v -> DynamicTest.dynamicTest(v.get("name").asText(), () -> {
+        return group("preflight").map(v -> vector("vectors.json", "preflight", v, () -> {
             SessionProviderGetEndpointResult ep = endpoint(v.get("endpoint"));
             String model = v.get("model").asText();
             if (v.hasNonNull("error")) {
@@ -669,7 +822,7 @@ class DecisionsTest {
 
     @TestFactory
     Stream<DynamicTest> retryVectors() {
-        return group("retry").map(v -> DynamicTest.dynamicTest(v.get("name").asText(), () -> {
+        return group("retry").map(v -> vector("vectors.json", "retry", v, () -> {
             FakeClient client = client(respond(401, "{\"error\":{\"type\":\"auth\",\"code\":\"expired\"}}"),
                     respond(200, OK_BODY));
             List<String> seen = Collections.synchronizedList(new ArrayList<>());
@@ -706,7 +859,7 @@ class DecisionsTest {
 
     @TestFactory
     Stream<DynamicTest> redactionLengthVectors() {
-        return group("redactionLength").map(v -> DynamicTest.dynamicTest(v.get("name").asText(), () -> {
+        return group("redactionLength").map(v -> vector("vectors.json", "redactionLength", v, () -> {
             String value = v.get("value").asText();
             String echoed = "echo:" + value.strip() + ":end";
             String expected = v.get("isSecret").asBoolean() ? "echo:[REDACTED]:end" : echoed;
@@ -719,20 +872,13 @@ class DecisionsTest {
             FakeClient client = client(respond(400, echoed, Map.of()));
             DecisionsException error = decisionsFailure(
                     decisionsWith(openai(value)).create(minimalRequest(), with(client)));
-            if (value.chars().allMatch(c -> c <= 0xFF)) {
-                assertEquals(expected, error.getBody());
-            } else {
-                // java.net.http rejects header values outside Latin-1 before sending.
-                assertEquals(DecisionsErrorKind.NETWORK, error.getKind());
-                assertEquals(0, client.calls.size());
-                assertFalse(String.valueOf(error.getCause()).contains(value.strip()));
-            }
+            assertEquals(expected, error.getBody());
         }));
     }
 
     @TestFactory
     Stream<DynamicTest> redactionVectors() {
-        return group("redaction").map(v -> DynamicTest.dynamicTest(v.get("name").asText(), () -> {
+        return group("redaction").map(v -> vector("vectors.json", "redaction", v, () -> {
             String body = v.get("body").asText();
             if (v.has("bodyRepeat")) {
                 body = body.replace("{{repeat}}",
@@ -758,13 +904,180 @@ class DecisionsTest {
             }
             String surfaces = String.join("\n", error.getMessage(), String.valueOf(error.getBody()),
                     String.valueOf(error.getErrorCode()), String.valueOf(error.getErrorType()),
-                    String.valueOf(error.getErrorParam()), error.toString(), String.valueOf(error.getCause()));
+                    String.valueOf(error.getErrorParam()), String.valueOf(error.getRequestId()), error.toString(),
+                    String.valueOf(error.getCause()));
             for (JsonNode secret : v.get("mustNotContain")) {
                 assertFalse(surfaces.contains(secret.asText()), "leaked " + secret.asText().length() + " chars");
             }
             if (!Boolean.TRUE.equals(error.getBodyTruncated())) {
                 assertTrue(error.getBody().contains("[REDACTED]"));
             }
+        }));
+    }
+
+    @TestFactory
+    Stream<DynamicTest> metadataVectors() {
+        return group(PRODUCTION_VECTORS, "metadata").map(v -> vector("production-vectors.json", "metadata", v, () -> {
+            FakeClient client = client(
+                    respond(v.get("status").asInt(), v.get("body").asText(), stringMap(v.get("headers"))));
+            DecisionsException error = decisionsFailure(
+                    decisionsWith(openai(v.get("apiKey").asText())).create(minimalRequest(), with(client)));
+            assertEquals(DecisionsErrorKind.HTTP, error.getKind());
+            assertEquals(v.get("status").asInt(), error.getStatus());
+            assertEquals(nullableString(v.get("expectedRequestId")), error.getRequestId());
+            if (v.has("expectedErrorType")) {
+                assertEquals(nullableString(v.get("expectedErrorType")), error.getErrorType());
+            }
+            if (v.has("expectedErrorCode")) {
+                assertEquals(nullableString(v.get("expectedErrorCode")), error.getErrorCode());
+            }
+        }));
+    }
+
+    private static String nullableString(JsonNode value) {
+        return value == null || value.isNull() ? null : value.asText();
+    }
+
+    private static HttpHeaders httpHeaders(Map<String, String> values) {
+        Map<String, List<String>> headers = new LinkedHashMap<>();
+        values.forEach((key, value) -> headers.put(key, List.of(value)));
+        return HttpHeaders.of(headers, (name, value) -> true);
+    }
+
+    @TestFactory
+    Stream<DynamicTest> retryAfterVectors() {
+        return group(PRODUCTION_VECTORS, "retryAfter")
+                .map(v -> vector("production-vectors.json", "retryAfter", v, () -> {
+                    Map<String, String> headers = stringMap(v.get("headers"));
+                    Long expected = v.get("expectedMs").isNull() ? null : v.get("expectedMs").longValue();
+                    assertEquals(expected,
+                            DecisionsRetryAfter.parse(httpHeaders(headers), v.get("nowEpochMs").longValue()));
+                    long before = System.currentTimeMillis();
+                    FakeClient client = client(respond(429, "{}", headers));
+                    DecisionsException error = decisionsFailure(
+                            decisionsWith(OPENAI).create(minimalRequest(), with(client)));
+                    Long earlier = DecisionsRetryAfter.parse(httpHeaders(headers), before);
+                    Long later = DecisionsRetryAfter.parse(httpHeaders(headers), System.currentTimeMillis());
+                    if (earlier == null) {
+                        assertNull(error.getRetryAfterMs());
+                    } else {
+                        assertNotNull(error.getRetryAfterMs());
+                        assertTrue(error.getRetryAfterMs() <= earlier);
+                        assertTrue(error.getRetryAfterMs() >= later);
+                    }
+                    assertEquals(DecisionsErrorKind.HTTP, error.getKind());
+                    assertEquals(429, error.getStatus());
+                    assertEquals(1, client.calls.size());
+                }));
+    }
+
+    private static String responseWithValue(String target, String rawJson) {
+        ObjectNode response = fixture("response.full.json").deepCopy();
+        String[] path = target.split("\\.");
+        JsonNode parent = response;
+        for (int i = 0; i < path.length - 1; i++) {
+            parent = parent.isArray() ? parent.get(Integer.parseInt(path[i])) : parent.get(path[i]);
+        }
+        ((ObjectNode) parent).putRawValue(path[path.length - 1], new RawValue(rawJson));
+        return response.toString();
+    }
+
+    private static String integerResult(DecisionsResult result, String target) {
+        long value = switch (target) {
+            case "usage.input_tokens" -> result.usage().inputTokens();
+            case "usage.total_tokens" -> result.usage().totalTokens();
+            case "usage.input_tokens_details.cached_tokens" -> result.usage().inputTokensDetails().cachedTokens();
+            case "answers.3.probabilities.0.value" ->
+                ((DecisionsAnswer.Score) result.answers().get(3)).probabilities().get(0).value();
+            default -> throw new AssertionError("Unhandled shared integer target: " + target);
+        };
+        return Long.toString(value);
+    }
+
+    @TestFactory
+    Stream<DynamicTest> responseNumberVectors() {
+        return group(PRODUCTION_VECTORS, "responseNumbers")
+                .map(v -> vector("production-vectors.json", "responseNumbers", v, () -> {
+                    String target = v.get("target").asText();
+                    String body = responseWithValue(target, v.get("jsonValue").asText());
+                    FakeClient client = client(respond(200, body));
+                    CompletableFuture<DecisionsResult> future = decisionsWith(OPENAI).create(minimalRequest(),
+                            with(client));
+                    String expectedError = nullableString(v.path("sdkErrors").get("java"));
+                    if (expectedError == null) {
+                        expectedError = nullableString(v.get("expectedError"));
+                    }
+                    if (expectedError != null) {
+                        assertEquals(expectedError, decisionsFailure(future).getKind().getValue());
+                    } else {
+                        DecisionsResult result = await(future);
+                        if (v.has("expectedInteger")) {
+                            assertEquals(v.get("expectedInteger").asText(), integerResult(result, target));
+                        } else {
+                            assertEquals("answers.3.score", target);
+                            assertEquals(v.get("expectedNumber").doubleValue(),
+                                    ((DecisionsAnswer.Score) result.answers().get(3)).score());
+                        }
+                    }
+                    assertEquals(1, client.calls.size());
+                }));
+    }
+
+    @TestFactory
+    Stream<DynamicTest> authBodyFailureVectors() {
+        return group(PRODUCTION_VECTORS, "authBodyFailure")
+                .map(v -> vector("production-vectors.json", "authBodyFailure", v, () -> {
+                    List<String> resolutions = new ArrayList<>();
+                    FailingStream body = new FailingStream("{\"error\":");
+                    FakeClient client = client(respond(v.get("status").asInt(), () -> body, Map.of()),
+                            respond(200, OK_BODY));
+                    DecisionsException error = decisionsFailure(
+                            decisionsWith(List.of(OPENAI, openai("synthetic-refreshed-credential")), resolutions)
+                                    .create(minimalRequest(), with(client)));
+                    assertEquals(v.get("expectedError").asText(), error.getKind().getValue());
+                    assertEquals(v.get("expectedResolves").asInt(), resolutions.size());
+                    assertEquals(v.get("expectedSends").asInt(), client.calls.size());
+                    assertEquals(v.get("expectedBodyClosed").asBoolean(), body.closed.get());
+                }));
+    }
+
+    @TestFactory
+    Stream<DynamicTest> deadlineVectors() {
+        return group(PRODUCTION_VECTORS, "deadline").map(v -> vector("production-vectors.json", "deadline", v, () -> {
+            String stage = v.get("stage").asText();
+            AtomicInteger resolutions = new AtomicInteger();
+            CompletableFuture<SessionProviderGetEndpointResult> pendingEndpoint = new CompletableFuture<>();
+            CompletableFuture<HttpResponse<InputStream>> pendingHeaders = new CompletableFuture<>();
+            BlockingStream body = new BlockingStream();
+            SessionDecisions decisions = new SessionDecisions(model -> {
+                int index = resolutions.incrementAndGet();
+                return stage.equals("endpoint") || stage.equals("refresh") && index == 2
+                        ? pendingEndpoint
+                        : CompletableFuture.completedFuture(OPENAI);
+            });
+            FakeClient client = switch (stage) {
+                case "headers" -> client(request -> pendingHeaders);
+                case "successBody" -> client(respond(200, () -> body, Map.of()));
+                case "errorBody" -> client(respond(v.get("status").asInt(), () -> body, Map.of()));
+                case "refresh" -> client(respond(v.get("status").asInt(), "{}"));
+                default -> client(respond(200, OK_BODY));
+            };
+            DecisionsException error = decisionsFailure(decisions.create(minimalRequest(),
+                    with(client).setTimeout(Duration.ofMillis(v.get("timeoutMs").asLong()))));
+            assertEquals(v.get("expectedError").asText(), error.getKind().getValue());
+            assertNull(error.getCause());
+            assertEquals(v.get("expectedResolves").asInt(), resolutions.get());
+            assertEquals(v.get("expectedSends").asInt(), client.calls.size());
+            if (stage.equals("headers")) {
+                assertTrue(pendingHeaders.isCancelled());
+            }
+            if (stage.endsWith("Body")) {
+                assertTrue(body.closed.get());
+                assertTrue(body.finished.await(TIMEOUT_SECONDS, TimeUnit.SECONDS));
+            }
+            pendingEndpoint.complete(openai("synthetic-late-credential"));
+            assertEquals(v.get("expectedSends").asInt(), client.calls.size());
+            assertEquals(v.get("expectedResolves").asInt(), resolutions.get());
         }));
     }
 
@@ -862,6 +1175,173 @@ class DecisionsTest {
     }
 
     @Test
+    void redactionShrinkCannotRetainAnyOriginalLookahead() throws Exception {
+        String secret = "synthetic-long-credential-for-retention";
+        String prefix = secret.repeat(2) + "x".repeat(SessionDecisions.MAX_ERROR_BODY_BYTES - secret.length() * 2);
+        FakeClient client = client(respond(400, prefix + "OUTSIDE-ORIGINAL-BUDGET"));
+        DecisionsException error = decisionsFailure(
+                decisionsWith(openai(secret)).create(minimalRequest(), with(client)));
+        assertEquals("[REDACTED]".repeat(2) + "x".repeat(SessionDecisions.MAX_ERROR_BODY_BYTES - secret.length() * 2),
+                error.getBody());
+        assertEquals(Boolean.TRUE, error.getBodyTruncated());
+    }
+
+    @Test
+    void unionsOriginalOverlapsWithoutReprocessingReplacementMarkers() throws Exception {
+        for (String secret : List.of("aaaa", "abab")) {
+            String body = secret.equals("aaaa") ? "aaaaaaa" : "ababababab";
+            FakeClient client = client(respond(400, body));
+            assertEquals("[REDACTED]",
+                    decisionsFailure(decisionsWith(openai(secret)).create(minimalRequest(), with(client))).getBody());
+        }
+        SessionProviderGetEndpointResult ep = endpoint(json("""
+                {"type":"openai","baseUrl":"https://example.com","apiKey":"synthetic-key",
+                 "headers":{},"sessionToken":{"header":"X-Session","token":"REDACTED"}}
+                """));
+        FakeClient client = client(respond(400, "synthetic-key REDACTED"));
+        assertEquals("[REDACTED] [REDACTED]",
+                decisionsFailure(decisionsWith(ep).create(minimalRequest(), with(client))).getBody());
+    }
+
+    @Test
+    void redactsShortAuthButKeepsNonAuthHeuristicsAndLiteralCase() throws Exception {
+        SessionProviderGetEndpointResult ep = endpoint(json("""
+                {"type":"openai","baseUrl":"https://example.com?short=%73%68%6Frt&long=synthetic-query",
+                 "apiKey":"XYZ","headers":{"Authorization":"bEaReR ABC","api-key":"DEF","X-Other":"short",
+                 "X-Session":"OLD"},"sessionToken":{"header":"X-Session","token":"NEW"}}
+                """));
+        FakeClient client = client(respond(400, "XYZ ABC DEF OLD NEW short %73%68%6Frt synthetic-query xyz"));
+        DecisionsException error = decisionsFailure(decisionsWith(ep).create(minimalRequest(), with(client)));
+        assertEquals("[REDACTED] [REDACTED] [REDACTED] [REDACTED] [REDACTED] short %73%68%6Frt [REDACTED] xyz",
+                error.getBody());
+    }
+
+    @Test
+    void protectsEarlierCredentialsInReplayHttpAndNetworkDiagnostics() throws Exception {
+        String first = "synthetic-old-credential";
+        String second = "synthetic-new-credential";
+        for (boolean network : List.of(false, true)) {
+            List<String> resolutions = new ArrayList<>();
+            Function<HttpRequest, CompletableFuture<HttpResponse<InputStream>>> finalAttempt = network
+                    ? request -> CompletableFuture
+                            .failedFuture(new CredentialFailure(first + " " + second, first + ":" + second))
+                    : respond(400,
+                            "{\"error\":{\"message\":\"" + first + " " + second + "\",\"code\":\"" + first
+                                    + "\",\"type\":\"" + second + "\",\"param\":\"" + first + "\"}}",
+                            Map.of("x-request-id", first + ":" + second));
+            FakeClient client = client(respond(401, "{}"), finalAttempt);
+            DecisionsException error = decisionsFailure(
+                    decisionsWith(List.of(openai(first), openai(second)), resolutions).create(minimalRequest(),
+                            with(client)));
+            String diagnostics = error.toString() + error.getBody() + error.getRequestId() + error.getErrorType()
+                    + error.getErrorCode() + error.getErrorParam() + error.getCause();
+            if (network) {
+                diagnostics += ((DecisionsSanitizedCause) error.getCause()).getCode();
+            }
+            assertFalse(diagnostics.contains(first));
+            assertFalse(diagnostics.contains(second));
+            assertEquals(network ? DecisionsErrorKind.NETWORK : DecisionsErrorKind.HTTP, error.getKind());
+            assertEquals(2, resolutions.size());
+            assertEquals(2, client.calls.size());
+            assertEquals("Bearer " + second,
+                    client.calls.get(1).request().headers().firstValue("authorization").orElseThrow());
+        }
+    }
+
+    @Test
+    void protectsRawAndDecodedInvalidUtf8QuerySecrets() throws Exception {
+        SessionProviderGetEndpointResult ep = endpoint(json("""
+                {"type":"openai","baseUrl":"https://example.com?sig=%FFcredential-0001","headers":{}}
+                """));
+        String raw = "%ffcredential-0001";
+        String decoded = "\uFFFDcredential-0001";
+        FakeClient client = client(respond(400, raw + " " + decoded, Map.of("x-request-id", raw)));
+        DecisionsException error = decisionsFailure(decisionsWith(ep).create(minimalRequest(), with(client)));
+        assertEquals("[REDACTED] [REDACTED]", error.getBody());
+        assertEquals("[REDACTED]", error.getRequestId());
+        client = client(request -> CompletableFuture.failedFuture(new CredentialFailure(raw + " " + decoded, raw)));
+        error = decisionsFailure(decisionsWith(ep).create(minimalRequest(), with(client)));
+        DecisionsSanitizedCause cause = (DecisionsSanitizedCause) error.getCause();
+        assertEquals("[REDACTED] [REDACTED]", cause.getMessage());
+        assertEquals("[REDACTED]", cause.getCode());
+        client = client(respond(400, "x".repeat(65532) + raw));
+        error = decisionsFailure(decisionsWith(ep).create(minimalRequest(), with(client)));
+        assertFalse(error.getBody().contains("%ff"));
+        assertTrue(error.getBodyTruncated());
+        assertTrue(error.getBody().getBytes(StandardCharsets.UTF_8).length <= 65536);
+    }
+
+    @Test
+    void readsNoMoreThanErrorBudgetLookaheadAndOneOverflowByte() throws Exception {
+        EndlessStream stream = new EndlessStream((byte) 'x');
+        String secret = "synthetic-bounded-read";
+        FakeClient client = client(respond(400, () -> stream, Map.of()));
+        DecisionsException error = decisionsFailure(
+                decisionsWith(openai(secret)).create(minimalRequest(), with(client)));
+        int lookahead = DecisionsRedaction
+                .maxSecretBytes(DecisionsEndpointPlanner.plan(openai(secret), "gpt-6-luna").secrets());
+        assertEquals(SessionDecisions.MAX_ERROR_BODY_BYTES + lookahead + 1, stream.served.get());
+        assertEquals(SessionDecisions.MAX_ERROR_BODY_BYTES, error.getBody().getBytes(StandardCharsets.UTF_8).length);
+        assertTrue(stream.closed.get());
+    }
+
+    @Test
+    void rejectsAllHeaderControlsAndUnpairedSurrogatesBeforeTransport() throws Exception {
+        List<String> values = new ArrayList<>(List.of("\uD800", "\uDC00", "valid\uD800tail", "valid\u007Ftail"));
+        for (char control = 0; control < 32; control++) {
+            if (control != '\t') {
+                values.add("synthetic" + control + "value");
+            }
+        }
+        FakeClient client = client(respond(200, OK_BODY));
+        for (String value : values) {
+            ObjectNode ep = (ObjectNode) json("""
+                    {"type":"openai","baseUrl":"https://example.com","apiKey":"synthetic",
+                     "headers":{"Authorization":"Bearer synthetic-shadow"}}
+                    """);
+            ep.put("apiKey", value);
+            DecisionsException error = decisionsFailure(
+                    decisionsWith(endpoint(ep)).create(minimalRequest(), with(client)));
+            assertEquals(DecisionsErrorKind.INVALID_ENDPOINT, error.getKind());
+            assertFalse(error.getMessage().contains(value));
+            ep.put("apiKey", "synthetic");
+            ((ObjectNode) ep.get("headers")).put("X-Unsafe", value);
+            assertEquals(DecisionsErrorKind.INVALID_ENDPOINT,
+                    decisionsFailure(decisionsWith(endpoint(ep)).create(minimalRequest(), with(client))).getKind());
+        }
+        assertEquals(0, client.calls.size());
+    }
+
+    @Test
+    void jdkHeaderEncodingErrorsAreSafeAndCustomTransportsKeepUnicode() throws Exception {
+        String secret = "synthetic-\uD83D\uDD11";
+        FakeClient client = client(respond(400, secret));
+        DecisionsException custom = decisionsFailure(
+                decisionsWith(openai(secret)).create(minimalRequest(), with(client)));
+        assertEquals("[REDACTED]", custom.getBody());
+        assertEquals("Bearer " + secret,
+                client.calls.get(0).request().headers().firstValue("authorization").orElseThrow());
+        DecisionsException builtin = decisionsFailure(decisionsWith(openai(secret)).create(minimalRequest()));
+        assertEquals(DecisionsErrorKind.NETWORK, builtin.getKind());
+        assertFalse(builtin.getMessage().contains(secret));
+        assertFalse(String.valueOf(builtin.getCause()).contains(secret));
+    }
+
+    @Test
+    void normalizesUrlsWithoutCollapsingRepeatedSlashesOrRewrappingIpv6() {
+        Map<String, String> cases = Map.of("http://[::1]/a//b/../v1", "http://[::1]/a//v1/decisions",
+                "http://EXAMPLE.COM:0/v1", "http://example.com:0/v1/decisions",
+                "https://example.com/%2e/a/../../v1?x=%2F&x=two", "https://example.com/v1/decisions?x=%2F&x=two");
+        cases.forEach(
+                (input, expected) -> assertEquals(expected, DecisionsEndpointPlanner.buildUrl(OPENAI.type(), input)));
+        for (String invalid : List.of("https://example.com:", "https://example.com:-1", "https://example.com:65536",
+                "https://[::1", "https://example.com/%2", "https://example.com?x=%", "http://[fe80::1%zone]")) {
+            assertEquals(DecisionsErrorKind.INVALID_ENDPOINT, assertThrows(DecisionsException.class,
+                    () -> DecisionsEndpointPlanner.buildUrl(OPENAI.type(), invalid)).getKind());
+        }
+    }
+
+    @Test
     void reportsNonJsonSuccessBodiesAsInvalidResponse() throws Exception {
         FakeClient client = client(respond(200, "<html>", Map.of()));
         DecisionsException error = decisionsFailure(decisionsWith(OPENAI).create(minimalRequest(), with(client)));
@@ -888,6 +1368,29 @@ class DecisionsTest {
         }
     }
 
+    /**
+     * Synthetic failure with credential-bearing diagnostics and discarded state.
+     */
+    public static final class CredentialFailure extends IOException {
+        private static final long serialVersionUID = 1L;
+        private final String code;
+
+        CredentialFailure(String message, String code) {
+            super(message, new IOException("synthetic-discarded-chain"));
+            this.code = code;
+            addSuppressed(new IOException("synthetic-discarded-suppressed"));
+        }
+
+        /**
+         * Returns the synthetic error code.
+         *
+         * @return the code
+         */
+        public String getCode() {
+            return code;
+        }
+    }
+
     @Test
     void wrapsTransportFailuresWithSanitizedCause() throws Exception {
         FakeClient client = client(request -> CompletableFuture.failedFuture(
@@ -902,6 +1405,77 @@ class DecisionsTest {
         assertNull(cause.getCause());
         assertEquals(0, cause.getStackTrace().length);
         assertEquals(0, cause.getSuppressed().length);
+    }
+
+    @Test
+    void protectsCauseNameMessageAndCodeAndDropsRawChains() throws Exception {
+        String secret = "CredentialFailure";
+        FakeClient client = client(request -> CompletableFuture
+                .failedFuture(new CredentialFailure(secret + " " + "x".repeat(70000), "code:" + secret)));
+        DecisionsException error = decisionsFailure(
+                decisionsWith(openai(secret)).create(minimalRequest(), with(client)));
+        DecisionsSanitizedCause cause = assertInstanceOf(DecisionsSanitizedCause.class, error.getCause());
+        assertFalse(cause.getName().contains(secret));
+        assertFalse(cause.getMessage().contains(secret));
+        assertFalse(cause.getCode().contains(secret));
+        assertTrue(cause.getMessage().getBytes(StandardCharsets.UTF_8).length <= 65536);
+        assertNull(cause.getCause());
+        assertEquals(0, cause.getSuppressed().length);
+        assertEquals(0, cause.getStackTrace().length);
+    }
+
+    @Test
+    void protectsEveryHttpDiagnosticAndBoundsLargeRequestIds() throws Exception {
+        String secret = "synthetic-diagnostic-secret";
+        ObjectNode envelope = MAPPER.createObjectNode();
+        ObjectNode fields = envelope.putObject("error");
+        for (String field : List.of("type", "code", "param", "message")) {
+            fields.put(field, secret);
+        }
+        FakeClient client = client(
+                respond(400, envelope.toString(), Map.of("x-request-id", secret + "x".repeat(70000))));
+        DecisionsException error = decisionsFailure(
+                decisionsWith(openai(secret)).create(minimalRequest(), with(client)));
+        for (String diagnostic : List.of(error.getMessage(), error.getBody(), error.getRequestId(),
+                error.getErrorType(), error.getErrorCode(), error.getErrorParam())) {
+            assertFalse(diagnostic.contains(secret));
+            assertTrue(diagnostic.getBytes(StandardCharsets.UTF_8).length <= 65536);
+        }
+    }
+
+    @Test
+    void endpointRpcFailuresNeverRetainUnknownCredentialsOrRawCauses() throws Exception {
+        String unknown = "synthetic-unknown-endpoint-credential";
+        for (boolean refresh : List.of(false, true)) {
+            AtomicInteger resolutions = new AtomicInteger();
+            SessionDecisions decisions = new SessionDecisions(model -> refresh && resolutions.getAndIncrement() == 0
+                    ? CompletableFuture.completedFuture(OPENAI)
+                    : CompletableFuture.failedFuture(new CredentialFailure(
+                            "RPC " + unknown + " COPILOT_ALLOW_GET_PROVIDER_ENDPOINT=true", unknown)));
+            FakeClient client = client(respond(401, "{}"));
+            DecisionsException error = decisionsFailure(decisions.create(minimalRequest(), with(client)));
+            assertEquals(DecisionsErrorKind.ENDPOINT_UNAVAILABLE, error.getKind());
+            assertFalse(error.toString().contains(unknown));
+            DecisionsSanitizedCause cause = assertInstanceOf(DecisionsSanitizedCause.class, error.getCause());
+            assertFalse(cause.toString().contains(unknown));
+            assertNull(cause.getCause());
+            assertEquals(0, cause.getStackTrace().length);
+            assertEquals(0, cause.getSuppressed().length);
+        }
+    }
+
+    @Test
+    void modelMismatchUsesFixedDiagnostics() throws Exception {
+        SessionProviderGetEndpointResult ep = endpoint(json("""
+                {"type":"openai","baseUrl":"https://example.com","headers":{},
+                 "sessionToken":{"header":"X-Session","token":"synthetic-token","model":"synthetic-secret-model"}}
+                """));
+        DecisionsException error = decisionsFailure(
+                decisionsWith(ep).create(minimalRequest().setModel("synthetic-request-model")));
+        assertEquals(DecisionsErrorKind.MODEL_MISMATCH, error.getKind());
+        assertFalse(error.getMessage().contains("synthetic-secret-model"));
+        assertFalse(error.getMessage().contains("synthetic-request-model"));
+        assertNull(error.getCause());
     }
 
     @Test
@@ -1119,20 +1693,415 @@ class DecisionsTest {
         future.cancel(true);
         assertInstanceOf(CancellationException.class, failure(future));
         assertTrue(stream.closed.get());
+        assertTrue(stream.finished.await(TIMEOUT_SECONDS, TimeUnit.SECONDS));
+    }
+
+    @Test
+    void cancellationStopsReadingWhenAnInterruptedStreamStillReturnsData() throws Exception {
+        for (int status : List.of(200, 401, 403)) {
+            CountDownLatch entered = new CountDownLatch(1);
+            CountDownLatch release = new CountDownLatch(1);
+            CountDownLatch readerClosed = new CountDownLatch(1);
+            AtomicInteger reads = new AtomicInteger();
+            TrackingStream stream = new TrackingStream() {
+                @Override
+                public int read(byte[] bytes, int offset, int length) throws IOException {
+                    if (reads.incrementAndGet() > 1) {
+                        throw new IOException("The cancelled body must not be read again.");
+                    }
+                    entered.countDown();
+                    try {
+                        release.await(TIMEOUT_SECONDS, TimeUnit.SECONDS);
+                    } catch (InterruptedException e) {
+                        Thread.currentThread().interrupt();
+                    }
+                    bytes[offset] = 'x';
+                    return 1;
+                }
+
+                @Override
+                public void close() {
+                    super.close();
+                    if (Thread.currentThread().getName().startsWith("copilot-decisions-reader-")) {
+                        readerClosed.countDown();
+                    }
+                }
+            };
+            List<String> resolutions = new ArrayList<>();
+            FakeClient client = client(respond(status, () -> stream, Map.of()));
+            CompletableFuture<DecisionsResult> future = decisionsWith(List.of(OPENAI), resolutions)
+                    .create(minimalRequest(), with(client).setTimeout(Duration.ZERO));
+            try {
+                assertTrue(entered.await(TIMEOUT_SECONDS, TimeUnit.SECONDS));
+                assertTrue(future.cancel(true));
+                assertInstanceOf(CancellationException.class, failure(future));
+                assertTrue(readerClosed.await(TIMEOUT_SECONDS, TimeUnit.SECONDS));
+                assertEquals(1, reads.get());
+                assertTrue(stream.closed.get());
+                assertEquals(1, resolutions.size());
+                assertEquals(1, client.calls.size());
+            } finally {
+                release.countDown();
+                future.cancel(true);
+            }
+        }
+    }
+
+    @Test
+    void defaultAndDisabledDeadlinesDoNotBecomeHeaderTimeouts() throws Exception {
+        assertEquals(Duration.ofSeconds(600), new DecisionsOptions().getTimeout());
+        assertEquals(Duration.ofSeconds(600), new DecisionsOptions().setTimeout(null).getTimeout());
+        assertThrows(IllegalArgumentException.class, () -> new DecisionsOptions().setTimeout(Duration.ofNanos(-1)));
+        for (Duration timeout : List.of(Duration.ZERO, Duration.ofSeconds(Long.MAX_VALUE))) {
+            CompletableFuture<HttpResponse<InputStream>> headers = new CompletableFuture<>();
+            FakeClient client = client(request -> headers);
+            CompletableFuture<DecisionsResult> future = decisionsWith(OPENAI).create(minimalRequest(),
+                    with(client).setTimeout(timeout));
+            assertFalse(future.isDone());
+            assertTrue(client.calls.get(0).request().timeout().isEmpty());
+            headers.complete(new FakeResponse(200, client.calls.get(0).request(), httpHeaders(Map.of()),
+                    new ByteArrayInputStream(OK_BODY.getBytes(StandardCharsets.UTF_8))));
+            assertEquals(6, await(future).answers().size());
+        }
+    }
+
+    @Test
+    void immediatelyExpiredDeadlineDoesNoEndpointOrHttpIo() throws Exception {
+        List<String> resolutions = new ArrayList<>();
+        FakeClient client = client(respond(200, OK_BODY));
+        DecisionsException error = decisionsFailure(decisionsWith(List.of(OPENAI), resolutions).create(minimalRequest(),
+                with(client).setTimeout(Duration.ofNanos(1))));
+        assertEquals(DecisionsErrorKind.TIMEOUT, error.getKind());
+        assertNull(error.getCause());
+        assertEquals(0, resolutions.size());
+        assertEquals(0, client.calls.size());
+    }
+
+    @Test
+    void oneDeadlineIncludesInitialResolutionAndRefresh() throws Exception {
+        CompletableFuture<SessionProviderGetEndpointResult> initial = new CompletableFuture<>();
+        CompletableFuture<SessionProviderGetEndpointResult> refresh = new CompletableFuture<>();
+        AtomicInteger resolutions = new AtomicInteger();
+        SessionDecisions decisions = new SessionDecisions(
+                model -> resolutions.incrementAndGet() == 1 ? initial : refresh);
+        FakeClient client = client(respond(401, "{}"));
+        CompletableFuture<DecisionsResult> future = decisions.create(minimalRequest(),
+                with(client).setTimeout(Duration.ofMillis(1200)));
+        Thread.sleep(700);
+        assertFalse(future.isDone());
+        initial.complete(OPENAI);
+        ExecutionException failure = assertThrows(ExecutionException.class,
+                () -> future.get(800, TimeUnit.MILLISECONDS));
+        DecisionsException error = assertInstanceOf(DecisionsException.class, failure.getCause());
+        assertEquals(DecisionsErrorKind.TIMEOUT, error.getKind());
+        assertNull(error.getCause());
+        assertEquals(2, resolutions.get());
+        refresh.complete(openai("synthetic-late-refresh"));
+        assertEquals(1, client.calls.size());
+    }
+
+    @Test
+    void preservesNativeCancellationAtResolverTransportAndBody() throws Exception {
+        CancellationException cancellation = new CancellationException("synthetic cancellation " + OPENAI.apiKey());
+        cancellation.initCause(new CredentialFailure(OPENAI.apiKey(), OPENAI.apiKey()));
+        SessionDecisions decisions = new SessionDecisions(model -> CompletableFuture.failedFuture(cancellation));
+        assertSafeCancellation(failure(decisions.create(minimalRequest())));
+        FakeClient client = client(request -> CompletableFuture.failedFuture(cancellation));
+        assertSafeCancellation(failure(decisionsWith(OPENAI).create(minimalRequest(), with(client))));
+        TrackingStream stream = new TrackingStream() {
+            @Override
+            public int read(byte[] bytes, int offset, int length) {
+                throw cancellation;
+            }
+        };
+        client = client(respond(200, () -> stream, Map.of()));
+        assertSafeCancellation(failure(decisionsWith(OPENAI).create(minimalRequest(), with(client))));
+        assertTrue(stream.closed.get());
+    }
+
+    private static void assertSafeCancellation(Throwable error) {
+        assertInstanceOf(CancellationException.class, error);
+        // JDK 25 get() may wrap a native cancellation in another native cancellation.
+        for (Throwable current = error; current != null; current = current.getCause()) {
+            assertInstanceOf(CancellationException.class, current);
+            assertFalse(String.valueOf(current.getMessage()).contains(OPENAI.apiKey()));
+            assertEquals(0, current.getSuppressed().length);
+        }
+    }
+
+    @Test
+    void throwingCloseCannotReplacePrimaryOutcomesOrLeakSuppressedCredentials() throws Exception {
+        String secret = "synthetic-close-credential";
+        for (String outcome : List.of("success", "http", "invalidResponse", "network", "timeout", "cancel")) {
+            CountDownLatch entered = new CountDownLatch(1);
+            CountDownLatch release = new CountDownLatch(1);
+            CountDownLatch readerClosed = new CountDownLatch(1);
+            AtomicBoolean closed = new AtomicBoolean();
+            String payload = outcome.equals("invalidResponse")
+                    ? "{"
+                    : outcome.equals("http") ? "{\"error\":{\"code\":\"synthetic-primary-code\"}}" : OK_BODY;
+            ByteArrayInputStream data = new ByteArrayInputStream(payload.getBytes(StandardCharsets.UTF_8));
+            InputStream stream = new InputStream() {
+                @Override
+                public int read() throws IOException {
+                    byte[] one = new byte[1];
+                    return read(one, 0, 1) < 0 ? -1 : one[0] & 0xFF;
+                }
+
+                @Override
+                public int read(byte[] bytes, int offset, int length) throws IOException {
+                    entered.countDown();
+                    if (outcome.equals("network")) {
+                        throw new IOException("primary " + secret);
+                    }
+                    if (outcome.equals("timeout") || outcome.equals("cancel")) {
+                        try {
+                            release.await(TIMEOUT_SECONDS, TimeUnit.SECONDS);
+                        } catch (InterruptedException e) {
+                            Thread.currentThread().interrupt();
+                        }
+                        return -1;
+                    }
+                    return data.read(bytes, offset, length);
+                }
+
+                @Override
+                public void close() throws IOException {
+                    closed.set(true);
+                    if (Thread.currentThread().getName().startsWith("copilot-decisions-reader-")) {
+                        readerClosed.countDown();
+                    }
+                    throw new IOException("cleanup " + secret);
+                }
+            };
+            int status = outcome.equals("http") ? 400 : outcome.equals("network") ? 401 : 200;
+            List<String> resolutions = new ArrayList<>();
+            FakeClient client = client(respond(status, () -> stream, Map.of()));
+            CompletableFuture<DecisionsResult> future = decisionsWith(List.of(openai(secret)), resolutions).create(
+                    minimalRequest(),
+                    with(client).setTimeout(outcome.equals("timeout") ? Duration.ofSeconds(2) : Duration.ZERO));
+            try {
+                assertTrue(entered.await(TIMEOUT_SECONDS, TimeUnit.SECONDS));
+                if (outcome.equals("success")) {
+                    assertEquals(6, await(future).answers().size());
+                } else {
+                    if (outcome.equals("cancel")) {
+                        assertTrue(future.cancel(true));
+                    }
+                    Throwable error = failure(future);
+                    if (outcome.equals("cancel")) {
+                        assertInstanceOf(CancellationException.class, error);
+                    } else {
+                        DecisionsException typed = assertInstanceOf(DecisionsException.class, error);
+                        assertEquals(outcome, typed.getKind().getValue());
+                        if (outcome.equals("http")) {
+                            assertEquals(400, typed.getStatus());
+                            assertEquals("synthetic-primary-code", typed.getErrorCode());
+                        } else if (outcome.equals("network")) {
+                            assertEquals("primary [REDACTED]", typed.getCause().getMessage());
+                        } else if (outcome.equals("timeout")) {
+                            assertNull(typed.getCause());
+                        }
+                    }
+                    for (Throwable current = error; current != null; current = current.getCause()) {
+                        assertFalse(current.toString().contains(secret));
+                        assertEquals(0, current.getSuppressed().length);
+                    }
+                }
+                assertTrue(closed.get());
+                assertTrue(readerClosed.await(TIMEOUT_SECONDS, TimeUnit.SECONDS));
+                assertEquals(1, resolutions.size());
+                assertEquals(1, client.calls.size());
+            } finally {
+                release.countDown();
+                future.cancel(true);
+            }
+        }
+    }
+
+    @Test
+    void earlierInjectedTransportTimeoutRemainsSanitizedNetwork() throws Exception {
+        FakeClient client = client(request -> CompletableFuture
+                .failedFuture(new HttpTimeoutException("synthetic network timeout " + OPENAI.apiKey())));
+        DecisionsException error = decisionsFailure(decisionsWith(OPENAI).create(minimalRequest(), with(client)));
+        assertEquals(DecisionsErrorKind.NETWORK, error.getKind());
+        assertInstanceOf(DecisionsSanitizedCause.class, error.getCause());
+        assertFalse(error.getCause().getMessage().contains(OPENAI.apiKey()));
+    }
+
+    @Test
+    void callerTimeoutClosesBodyAndRemainsNative() throws Exception {
+        BlockingStream stream = new BlockingStream();
+        FakeClient client = client(respond(200, () -> stream, Map.of()));
+        CompletableFuture<DecisionsResult> future = decisionsWith(OPENAI).create(minimalRequest(),
+                with(client).setTimeout(Duration.ZERO));
+        assertTrue(stream.reading.await(TIMEOUT_SECONDS, TimeUnit.SECONDS));
+        future.orTimeout(100, TimeUnit.MILLISECONDS);
+        assertInstanceOf(TimeoutException.class, failure(future));
+        assertTrue(stream.closedLatch.await(TIMEOUT_SECONDS, TimeUnit.SECONDS));
+        assertTrue(stream.finished.await(TIMEOUT_SECONDS, TimeUnit.SECONDS));
+        assertTrue(stream.closed.get());
+    }
+
+    @Test
+    void callerCancellationWinsBeforeSdkDeadlineAndSkipsLateEndpoint() throws Exception {
+        CompletableFuture<SessionProviderGetEndpointResult> endpoint = new CompletableFuture<>();
+        FakeClient client = client(respond(200, OK_BODY));
+        CompletableFuture<DecisionsResult> future = new SessionDecisions(model -> endpoint).create(minimalRequest(),
+                with(client).setTimeout(Duration.ofMillis(150)));
+        assertTrue(future.cancel(true));
+        Thread.sleep(200);
+        endpoint.completeExceptionally(new CredentialFailure("synthetic late RPC failure", "synthetic code"));
+        assertInstanceOf(CancellationException.class, failure(future));
+        assertEquals(0, client.calls.size());
+    }
+
+    /**
+     * A transport that observes cancellation but can still deliver a late response.
+     */
+    static final class LateResponse extends CompletableFuture<HttpResponse<InputStream>> {
+        final AtomicBoolean cancelled = new AtomicBoolean();
+
+        @Override
+        public boolean cancel(boolean mayInterruptIfRunning) {
+            cancelled.set(true);
+            return false;
+        }
+    }
+
+    @Test
+    void closesLateAcquiredBodiesAfterDeadlineOrCancellation() throws Exception {
+        for (boolean cancel : List.of(false, true)) {
+            LateResponse pending = new LateResponse();
+            FakeClient client = client(request -> pending);
+            CompletableFuture<DecisionsResult> future = decisionsWith(OPENAI).create(minimalRequest(),
+                    with(client).setTimeout(Duration.ofMillis(150)));
+            if (cancel) {
+                assertTrue(future.cancel(true));
+                assertInstanceOf(CancellationException.class, failure(future));
+            } else {
+                assertEquals(DecisionsErrorKind.TIMEOUT, decisionsFailure(future).getKind());
+            }
+            assertTrue(pending.cancelled.get());
+            AtomicBoolean closed = new AtomicBoolean();
+            ByteArrayInputStream body = new ByteArrayInputStream(OK_BODY.getBytes(StandardCharsets.UTF_8)) {
+                @Override
+                public void close() throws IOException {
+                    closed.set(true);
+                    super.close();
+                }
+            };
+            pending.complete(new FakeResponse(200, client.calls.get(0).request(), httpHeaders(Map.of()), body));
+            assertTrue(closed.get());
+            assertEquals(1, client.calls.size());
+        }
+    }
+
+    @Test
+    void closesAuthBodyBeforeStartingCredentialRefresh() throws Exception {
+        AtomicBoolean closed = new AtomicBoolean();
+        InputStream body = new ByteArrayInputStream("{}".getBytes(StandardCharsets.UTF_8)) {
+            @Override
+            public void close() throws IOException {
+                closed.set(true);
+                super.close();
+            }
+        };
+        AtomicInteger resolutions = new AtomicInteger();
+        SessionDecisions decisions = new SessionDecisions(model -> {
+            if (resolutions.incrementAndGet() == 1) {
+                return CompletableFuture.completedFuture(OPENAI);
+            }
+            assertTrue(closed.get());
+            return CompletableFuture.completedFuture(openai("synthetic-refreshed-key"));
+        });
+        FakeClient client = client(respond(401, () -> body, Map.of()), respond(200, OK_BODY));
+        assertEquals(6, await(decisions.create(minimalRequest(), with(client))).answers().size());
+        assertEquals(2, resolutions.get());
+    }
+
+    @Test
+    void timeoutInterruptsCooperativeRefreshWorkOnTheReader() throws Exception {
+        CountDownLatch refreshing = new CountDownLatch(1);
+        CountDownLatch finished = new CountDownLatch(1);
+        CountDownLatch release = new CountDownLatch(1);
+        AtomicInteger resolutions = new AtomicInteger();
+        SessionDecisions decisions = new SessionDecisions(model -> {
+            if (resolutions.incrementAndGet() == 1) {
+                return CompletableFuture.completedFuture(OPENAI);
+            }
+            refreshing.countDown();
+            try {
+                release.await(TIMEOUT_SECONDS, TimeUnit.SECONDS);
+                return CompletableFuture.completedFuture(openai("synthetic-never-sent"));
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                throw new CancellationException();
+            } finally {
+                finished.countDown();
+            }
+        });
+        FakeClient client = client(respond(401, "{}"));
+        try {
+            CompletableFuture<DecisionsResult> future = decisions.create(minimalRequest(),
+                    with(client).setTimeout(Duration.ofSeconds(1)));
+            assertTrue(refreshing.await(TIMEOUT_SECONDS, TimeUnit.SECONDS));
+            assertEquals(DecisionsErrorKind.TIMEOUT, decisionsFailure(future).getKind());
+            assertTrue(finished.await(1, TimeUnit.SECONDS));
+            assertEquals(1, client.calls.size());
+        } finally {
+            release.countDown();
+            if (refreshing.getCount() == 0) {
+                assertTrue(finished.await(TIMEOUT_SECONDS, TimeUnit.SECONDS));
+            }
+        }
+    }
+
+    @Test
+    void leavesNoReaderOrDeadlineThreadsAfterCompletedCalls() throws Exception {
+        FakeClient client = client(respond(200, OK_BODY));
+        for (int i = 0; i < 10; i++) {
+            await(decisionsWith(OPENAI).create(minimalRequest(), with(client)));
+        }
+        long end = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
+        while (hasDecisionsWorker() && System.nanoTime() < end) {
+            Thread.sleep(25);
+        }
+        assertFalse(hasDecisionsWorker());
+    }
+
+    private static boolean hasDecisionsWorker() {
+        return Thread.getAllStackTraces().keySet().stream()
+                .anyMatch(thread -> thread.isAlive() && (thread.getName().startsWith("copilot-decisions-reader-")
+                        || thread.getName().equals("copilot-decisions-deadline")));
     }
 
     // ----------------------------------------------------------------- real HTTP
 
     /** A minimal HTTP/1.1 server that answers one request per connection. */
     static final class MiniServer implements AutoCloseable {
+        @FunctionalInterface
+        interface Handler {
+            void respond(Socket connection, String path, Map<String, String> headers) throws IOException;
+        }
+
         final List<String> hits = Collections.synchronizedList(new ArrayList<>());
         volatile Map<String, String> lastHeaders = Map.of();
         volatile String lastBody;
         private final ServerSocket socket;
-        private final Function<String, String> handler;
+        private final Handler handler;
         private final Thread thread;
+        private volatile Socket active;
 
         MiniServer(Function<String, String> handler) throws IOException {
+            this((connection, path, headers) -> {
+                OutputStream out = connection.getOutputStream();
+                out.write(handler.apply(path).getBytes(StandardCharsets.UTF_8));
+                out.flush();
+            });
+        }
+
+        MiniServer(Handler handler) throws IOException {
             this.handler = handler;
             this.socket = new ServerSocket(0, 50, InetAddress.getLoopbackAddress());
             this.thread = new Thread(this::serve, "decisions-test-server");
@@ -1147,9 +2116,13 @@ class DecisionsTest {
         private void serve() {
             while (!socket.isClosed()) {
                 try (Socket client = socket.accept()) {
+                    active = client;
+                    client.setSoTimeout(5000);
                     handle(client);
                 } catch (IOException e) {
                     // Closed or client went away.
+                } finally {
+                    active = null;
                 }
             }
         }
@@ -1171,10 +2144,7 @@ class DecisionsTest {
             hits.add(path);
             lastHeaders = headers;
             lastBody = new String(body, StandardCharsets.UTF_8);
-            String response = handler.apply(path);
-            OutputStream out = client.getOutputStream();
-            out.write(response.getBytes(StandardCharsets.UTF_8));
-            out.flush();
+            handler.respond(client, path, headers);
         }
 
         private static String readLine(InputStream in) throws IOException {
@@ -1201,6 +2171,19 @@ class DecisionsTest {
         @Override
         public void close() throws IOException {
             socket.close();
+            Socket connection = active;
+            if (connection != null) {
+                connection.close();
+            }
+            try {
+                thread.join(TimeUnit.SECONDS.toMillis(TIMEOUT_SECONDS));
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                throw new IOException("Interrupted while stopping the synthetic HTTP server.", e);
+            }
+            if (thread.isAlive()) {
+                throw new IOException("Synthetic HTTP server did not stop.");
+            }
         }
     }
 
@@ -1235,6 +2218,89 @@ class DecisionsTest {
             assertEquals(307, error.getStatus());
             assertTrue(error.getMessage().contains("redirects are not followed"));
             assertEquals(List.of("/v1/decisions"), server.hits);
+        }
+    }
+
+    @Test
+    void slowRealHttpBodiesCloseOnSdkDeadlineAndCallerCancellation() throws Exception {
+        for (int status : new int[]{200, 401}) {
+            for (boolean cancel : List.of(false, true)) {
+                CountDownLatch headersSent = new CountDownLatch(1);
+                CountDownLatch peerClosed = new CountDownLatch(1);
+                try (MiniServer server = new MiniServer((connection, path, headers) -> {
+                    connection.getOutputStream()
+                            .write(("HTTP/1.1 " + status
+                                    + " Synthetic\r\nContent-Length: 100000\r\nConnection: close\r\n\r\n{")
+                                    .getBytes(StandardCharsets.US_ASCII));
+                    connection.getOutputStream().flush();
+                    headersSent.countDown();
+                    try {
+                        if (connection.getInputStream().read() == -1) {
+                            peerClosed.countDown();
+                        }
+                    } catch (SocketException e) {
+                        peerClosed.countDown();
+                    }
+                })) {
+                    List<String> resolutions = new ArrayList<>();
+                    CompletableFuture<DecisionsResult> future = decisionsWith(List.of(local(server.baseUrl(), "{}")),
+                            resolutions)
+                            .create(minimalRequest(), new DecisionsOptions().setTimeout(Duration.ofSeconds(2)));
+                    assertTrue(headersSent.await(TIMEOUT_SECONDS, TimeUnit.SECONDS));
+                    if (cancel) {
+                        assertTrue(future.cancel(true));
+                        assertInstanceOf(CancellationException.class, failure(future));
+                    } else {
+                        DecisionsException error = decisionsFailure(future);
+                        assertEquals(DecisionsErrorKind.TIMEOUT, error.getKind());
+                        assertNull(error.getCause());
+                    }
+                    assertTrue(peerClosed.await(TIMEOUT_SECONDS, TimeUnit.SECONDS));
+                    assertEquals(1, resolutions.size());
+                    assertEquals(List.of("/v1/decisions"), server.hits);
+                }
+            }
+        }
+    }
+
+    @Test
+    void realHttpRefreshUsesChangedCredentialsExactlyOnce() throws Exception {
+        AtomicInteger responses = new AtomicInteger();
+        List<String> credentials = Collections.synchronizedList(new ArrayList<>());
+        try (MiniServer server = new MiniServer((connection, path, headers) -> {
+            credentials.add(headers.get("authorization"));
+            boolean first = responses.incrementAndGet() == 1;
+            String response = MiniServer.response(first ? 401 : 200, "Synthetic",
+                    Map.of("Content-Type", "application/json"), first ? "{}" : OK_BODY);
+            connection.getOutputStream().write(response.getBytes(StandardCharsets.UTF_8));
+            connection.getOutputStream().flush();
+        })) {
+            ObjectNode first = (ObjectNode) json("{\"type\":\"openai\",\"headers\":{}}");
+            first.put("baseUrl", server.baseUrl()).put("apiKey", "synthetic-first-key");
+            ObjectNode second = first.deepCopy().put("apiKey", "synthetic-second-key");
+            List<String> resolutions = new ArrayList<>();
+            DecisionsResult result = await(decisionsWith(List.of(endpoint(first), endpoint(second)), resolutions)
+                    .create(minimalRequest(), new DecisionsOptions().setTimeout(Duration.ofSeconds(5))));
+            assertEquals(6, result.answers().size());
+            assertEquals(2, resolutions.size());
+            assertEquals(2, server.hits.size());
+            assertEquals(List.of("Bearer synthetic-first-key", "Bearer synthetic-second-key"), credentials);
+        }
+    }
+
+    @Test
+    void truncatedRealAuthBodiesDoNotRefreshOrReplay() throws Exception {
+        for (int status : new int[]{401, 403}) {
+            try (MiniServer server = new MiniServer(path -> "HTTP/1.1 " + status
+                    + " Synthetic\r\nContent-Length: 100\r\nConnection: close\r\n\r\n{}")) {
+                List<String> resolutions = new ArrayList<>();
+                DecisionsException error = decisionsFailure(
+                        decisionsWith(List.of(local(server.baseUrl(), "{}")), resolutions).create(minimalRequest(),
+                                new DecisionsOptions().setTimeout(Duration.ofSeconds(5))));
+                assertEquals(DecisionsErrorKind.NETWORK, error.getKind());
+                assertEquals(1, resolutions.size());
+                assertEquals(1, server.hits.size());
+            }
         }
     }
 }

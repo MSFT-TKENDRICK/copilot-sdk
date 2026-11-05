@@ -9,17 +9,25 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.net.URI;
 import java.net.http.HttpClient;
+import java.net.http.HttpHeaders;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
 import java.nio.charset.StandardCharsets;
+import java.time.Duration;
 import java.util.List;
+import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
+import java.util.Map;
 import java.util.Objects;
+import java.util.Optional;
+import java.util.Set;
 import java.util.concurrent.CancellationException;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
 import java.util.concurrent.ExecutionException;
-import java.util.concurrent.Executor;
-import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledFuture;
+import java.util.concurrent.ScheduledThreadPoolExecutor;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.Function;
 
@@ -38,10 +46,11 @@ import com.github.copilot.generated.rpc.SessionProviderGetEndpointResult;
  * endpoint. Obtain it with {@link CopilotSession#getDecisions()}.
  * <p>
  * The runtime must run with {@code COPILOT_ALLOW_GET_PROVIDER_ENDPOINT=true}.
- * Redirects are never followed. Error messages and bodies never contain
- * credentials. Cancelling the future returned by {@link #create} aborts the
- * in-flight request; the future then reports a {@link CancellationException},
- * never a {@link DecisionsException}.
+ * The built-in HTTP client never follows redirects. Known credentials and their
+ * supported encodings are redacted from bounded provider diagnostics; this is
+ * not general PII removal. Cancelling the future returned by {@link #create}
+ * aborts the in-flight request; the future then reports a
+ * {@link CancellationException}, never a {@link DecisionsException}.
  *
  * @since 1.0.0
  */
@@ -53,8 +62,8 @@ public final class SessionDecisions {
     static final String GATE_ENV = "COPILOT_ALLOW_GET_PROVIDER_ENDPOINT";
 
     private static final int CHUNK_BYTES = 8 * 1024;
-    private static final ObjectMapper MAPPER = new ObjectMapper()
-            .enable(DeserializationFeature.FAIL_ON_TRAILING_TOKENS);
+    private static final ObjectMapper MAPPER = new ObjectMapper().enable(DeserializationFeature.FAIL_ON_TRAILING_TOKENS,
+            DeserializationFeature.USE_BIG_DECIMAL_FOR_FLOATS);
 
     private final Function<String, CompletableFuture<SessionProviderGetEndpointResult>> resolveEndpoint;
 
@@ -113,12 +122,18 @@ public final class SessionDecisions {
         if (request.getModel() == null || request.getModel().isEmpty()) {
             throw new IllegalArgumentException("DecisionsRequest.model is required.");
         }
+        long startedNanos = System.nanoTime();
         DecisionsOptions opts = options == null ? new DecisionsOptions() : options;
+        Duration timeout = opts.getTimeout();
+        if (timeout.isNegative()) {
+            throw new IllegalArgumentException("timeout must not be negative.");
+        }
         HttpClient client = opts.getHttpClient();
         if (client == null) {
             client = DefaultClient.INSTANCE;
         }
-        return new Call(request, opts, client).start();
+        return new Call(request, opts.getEndpointModelId(), timeout, startedNanos, client, opts.getHttpClient() != null)
+                .start();
     }
 
     private static final class DefaultClient {
@@ -127,11 +142,22 @@ public final class SessionDecisions {
 
     private static final class Readers {
         private static final AtomicInteger COUNTER = new AtomicInteger();
-        static final Executor EXECUTOR = Executors.newCachedThreadPool(r -> {
-            Thread t = new Thread(r, "copilot-decisions-reader-" + COUNTER.incrementAndGet());
-            t.setDaemon(true);
-            return t;
-        });
+    }
+
+    private static final class Deadlines {
+        static final ScheduledThreadPoolExecutor EXECUTOR = createExecutor();
+
+        private static ScheduledThreadPoolExecutor createExecutor() {
+            ScheduledThreadPoolExecutor executor = new ScheduledThreadPoolExecutor(1, r -> {
+                Thread thread = new Thread(r, "copilot-decisions-deadline");
+                thread.setDaemon(true);
+                return thread;
+            });
+            executor.setRemoveOnCancelPolicy(true);
+            executor.setKeepAliveTime(1, TimeUnit.SECONDS);
+            executor.allowCoreThreadTimeOut(true);
+            return executor;
+        }
     }
 
     /**
@@ -155,7 +181,10 @@ public final class SessionDecisions {
         int total = 0;
         boolean exceeded = false;
         for (;;) {
-            int n = in.read(buffer);
+            if (Thread.currentThread().isInterrupted()) {
+                throw new CancellationException();
+            }
+            int n = in.read(buffer, 0, (int) Math.min(buffer.length, (long) limit - total + 1));
             if (n < 0) {
                 break;
             }
@@ -181,12 +210,18 @@ public final class SessionDecisions {
     }
 
     static DecisionsException endpointUnavailable(Throwable cause) {
-        String text = cause == null || cause.getMessage() == null ? "" : cause.getMessage();
+        String text;
+        try {
+            text = cause == null || cause.getMessage() == null ? "" : cause.getMessage();
+        } catch (RuntimeException e) {
+            text = "";
+        }
         String message = text.contains(GATE_ENV)
                 ? "session.decisions requires the runtime's provider endpoint API. Set " + GATE_ENV
                         + "=true in the runtime's environment (for in-process runtimes, in the host process environment before the runtime is loaded)."
                 : "Could not resolve the session's provider endpoint for the Decisions API.";
-        return new DecisionsException(DecisionsErrorKind.ENDPOINT_UNAVAILABLE, message, cause);
+        return new DecisionsException(DecisionsErrorKind.ENDPOINT_UNAVAILABLE, message, new DecisionsSanitizedCause(
+                "ProviderEndpointResolutionFailure", "Provider endpoint resolution failed.", null));
     }
 
     static DecisionsException networkError(String message, Throwable error, List<String> secrets) {
@@ -207,25 +242,15 @@ public final class SessionDecisions {
     }
 
     /**
-     * Redacts before truncating, so a credential straddling the cap is never
-     * partially retained.
+     * Uses lookahead only to recognize secrets crossing the original byte cap.
      */
     static ErrorBody redactErrorBody(Bounded read, List<String> secrets) {
         String raw = new String(read.bytes(), StandardCharsets.UTF_8);
-        String redacted = DecisionsRedaction.redact(raw, secrets);
-        byte[] encoded = redacted.getBytes(StandardCharsets.UTF_8);
+        int retained = new String(read.bytes(), 0, DecisionsRedaction.utf8Cut(read.bytes(), MAX_ERROR_BODY_BYTES),
+                StandardCharsets.UTF_8).length();
+        String redacted = DecisionsRedaction.redactPrefix(raw, retained, secrets);
         boolean truncated = read.exceeded() || read.bytes().length > MAX_ERROR_BODY_BYTES;
-        if (encoded.length <= MAX_ERROR_BODY_BYTES) {
-            return new ErrorBody(raw, redacted, truncated);
-        }
-        // Cut even when not truncated: redaction or lossy decoding can grow the text.
-        // Back off to a UTF-8 boundary: a split trailing character is dropped, never
-        // emitted as U+FFFD.
-        int cut = MAX_ERROR_BODY_BYTES;
-        while (cut > 0 && (encoded[cut] & 0xC0) == 0x80) {
-            cut--;
-        }
-        return new ErrorBody(raw, new String(encoded, 0, cut, StandardCharsets.UTF_8), truncated);
+        return new ErrorBody(raw, DecisionsRedaction.capUtf8(redacted, MAX_ERROR_BODY_BYTES), truncated);
     }
 
     private static String stringField(JsonNode value) {
@@ -239,19 +264,17 @@ public final class SessionDecisions {
             return Boolean.toString(value.booleanValue());
         }
         if (value.isNumber()) {
-            if (value.isIntegralNumber()) {
-                return value.asText();
-            }
-            double d = value.doubleValue();
-            if (d == Math.rint(d) && Math.abs(d) < 1e21) {
-                return Long.toString((long) d);
-            }
-            return Double.toString(d);
+            return value.asText();
         }
         return null;
     }
 
     static DecisionsException httpError(int status, String requestId, ErrorBody errorBody, List<String> secrets) {
+        return httpError(status, requestId, errorBody, secrets, null);
+    }
+
+    private static DecisionsException httpError(int status, String requestId, ErrorBody errorBody, List<String> secrets,
+            Long retryAfterMs) {
         String errorType = null;
         String errorCode = null;
         String errorParam = null;
@@ -259,7 +282,7 @@ public final class SessionDecisions {
         if (!errorBody.truncated()) {
             JsonNode parsed = null;
             try {
-                parsed = MAPPER.readTree(errorBody.raw());
+                parsed = MAPPER.readTree(stripBom(errorBody.raw()));
             } catch (JsonProcessingException e) {
                 // Non-JSON error body.
             }
@@ -276,20 +299,19 @@ public final class SessionDecisions {
                 : "HTTP " + status;
         String message = "Decisions request failed with " + statusText
                 + (errorMessage != null && !errorMessage.isEmpty() ? ": " + errorMessage : ".");
-        return new DecisionsException(DecisionsErrorKind.HTTP, message, null, status, errorType, errorCode, errorParam,
-                requestId, errorBody.body(), errorBody.truncated());
+        return new DecisionsException(DecisionsErrorKind.HTTP,
+                DecisionsRedaction.capUtf8(message, MAX_ERROR_BODY_BYTES), null, status, errorType, errorCode,
+                errorParam, DecisionsRedaction.sanitize(requestId, secrets), errorBody.body(), errorBody.truncated(),
+                retryAfterMs);
     }
 
     private static String redactField(JsonNode value, List<String> secrets) {
         String s = stringField(value);
-        return s == null ? null : DecisionsRedaction.redact(s, secrets);
+        return DecisionsRedaction.sanitize(s, secrets);
     }
 
     static JsonNode parseJson(byte[] bytes) {
-        String text = new String(bytes, StandardCharsets.UTF_8);
-        if (text.startsWith("\uFEFF")) {
-            text = text.substring(1);
-        }
+        String text = stripBom(new String(bytes, StandardCharsets.UTF_8));
         JsonNode json = null;
         try {
             json = MAPPER.readTree(text);
@@ -303,31 +325,115 @@ public final class SessionDecisions {
         return json;
     }
 
+    private static String stripBom(String text) {
+        return text.startsWith("\uFEFF") ? text.substring(1) : text;
+    }
+
     private static <T> CompletableFuture<T> failed(Throwable error) {
         return CompletableFuture.failedFuture(error);
+    }
+
+    private static CancellationException cancelled() {
+        return new CancellationException("The Decisions call was cancelled.");
+    }
+
+    /**
+     * Keeps valid Unicode header values representable for caller-owned transports.
+     */
+    private static final class CustomRequest extends HttpRequest {
+        private final URI uri;
+        private final HttpHeaders headers;
+        private final byte[] body;
+
+        CustomRequest(DecisionsEndpointPlanner.Plan plan, byte[] body) {
+            this.uri = URI.create(plan.url());
+            Map<String, List<String>> values = new LinkedHashMap<>();
+            plan.headers().forEach((name, value) -> values.put(name, List.of(value)));
+            this.headers = HttpHeaders.of(values, (name, value) -> true);
+            this.body = body;
+        }
+
+        @Override
+        public Optional<BodyPublisher> bodyPublisher() {
+            return Optional.of(BodyPublishers.ofByteArray(body));
+        }
+
+        @Override
+        public String method() {
+            return "POST";
+        }
+
+        @Override
+        public Optional<Duration> timeout() {
+            return Optional.empty();
+        }
+
+        @Override
+        public boolean expectContinue() {
+            return false;
+        }
+
+        @Override
+        public URI uri() {
+            return uri;
+        }
+
+        @Override
+        public Optional<HttpClient.Version> version() {
+            return Optional.empty();
+        }
+
+        @Override
+        public HttpHeaders headers() {
+            return headers;
+        }
     }
 
     /** One {@code create} invocation. */
     private final class Call {
 
         private final DecisionsRequest request;
-        private final DecisionsOptions options;
+        private final String endpointModelId;
+        private final long timeoutNanos;
+        private final long startedNanos;
         private final HttpClient client;
+        private final boolean customClient;
         private final CompletableFuture<DecisionsResult> result = new CompletableFuture<>();
         private final Object lock = new Object();
+        private final Set<String> knownSecrets = new LinkedHashSet<>();
         private CompletableFuture<?> inFlight;
         private InputStream openStream;
+        private Thread reader;
+        private CompletableFuture<Bounded> bodyRead;
+        private ScheduledFuture<?> timer;
+        private boolean stopped;
 
-        Call(DecisionsRequest request, DecisionsOptions options, HttpClient client) {
+        Call(DecisionsRequest request, String endpointModelId, Duration timeout, long startedNanos, HttpClient client,
+                boolean customClient) {
             this.request = request;
-            this.options = options;
+            this.endpointModelId = endpointModelId;
+            this.startedNanos = startedNanos;
             this.client = client;
+            this.customClient = customClient;
+            long nanos;
+            try {
+                nanos = timeout.toNanos();
+            } catch (ArithmeticException e) {
+                nanos = Long.MAX_VALUE;
+            }
+            this.timeoutNanos = nanos;
         }
 
         CompletableFuture<DecisionsResult> start() {
             // Any completion of the returned future from outside (cancel,
             // orTimeout, completeExceptionally) aborts in-flight I/O.
             result.whenComplete((r, e) -> abort());
+            if (timeoutNanos != 0) {
+                synchronized (lock) {
+                    timer = Deadlines.EXECUTOR.schedule(() -> complete(null, timeoutError()),
+                            Math.max(0, timeoutNanos - (System.nanoTime() - startedNanos)), TimeUnit.NANOSECONDS);
+                }
+            }
             CompletableFuture<DecisionsResult> pipeline;
             try {
                 pipeline = run();
@@ -335,55 +441,112 @@ public final class SessionDecisions {
                 pipeline = failed(e);
             }
             pipeline.whenComplete((r, e) -> {
-                if (e == null) {
-                    result.complete(r);
-                } else {
-                    result.completeExceptionally(unwrap(e));
-                }
+                Throwable error = e == null ? null : unwrap(e);
+                complete(r, !(error instanceof CancellationException) && expired() ? timeoutError() : error);
             });
             return result;
         }
 
-        private boolean aborted() {
-            return result.isDone();
+        private boolean expired() {
+            return timeoutNanos != 0 && System.nanoTime() - startedNanos >= timeoutNanos;
+        }
+
+        private DecisionsException timeoutError() {
+            return new DecisionsException(DecisionsErrorKind.TIMEOUT, "The Decisions call exceeded its SDK deadline.");
+        }
+
+        private void requireActive() {
+            synchronized (lock) {
+                if (stopped || result.isDone()) {
+                    throw new CancellationException();
+                }
+            }
+            if (expired()) {
+                complete(null, timeoutError());
+                throw new CancellationException();
+            }
+        }
+
+        private void complete(DecisionsResult value, Throwable error) {
+            synchronized (lock) {
+                if (stopped || result.isDone()) {
+                    return;
+                }
+                stopped = true;
+            }
+            abort();
+            if (error == null) {
+                result.complete(value);
+            } else {
+                result.completeExceptionally(error);
+            }
         }
 
         private void abort() {
             CompletableFuture<?> pending;
             InputStream stream;
+            Thread readingThread;
+            CompletableFuture<Bounded> reading;
+            ScheduledFuture<?> deadline;
             synchronized (lock) {
+                stopped = true;
                 pending = inFlight;
                 stream = openStream;
+                readingThread = reader;
+                reading = bodyRead;
+                deadline = timer;
                 inFlight = null;
                 openStream = null;
+                reader = null;
+                bodyRead = null;
+                timer = null;
+            }
+            if (deadline != null) {
+                deadline.cancel(false);
             }
             if (pending != null) {
                 pending.cancel(true);
             }
+            if (readingThread != null && readingThread != Thread.currentThread()) {
+                readingThread.interrupt();
+            }
             closeQuietly(stream);
+            if (reading != null) {
+                reading.cancel(false);
+            }
         }
 
         private void track(CompletableFuture<?> future) {
+            boolean cancel;
             synchronized (lock) {
-                inFlight = future;
+                cancel = stopped || result.isDone();
+                if (!cancel) {
+                    inFlight = future;
+                }
             }
-            if (aborted()) {
+            if (cancel) {
                 future.cancel(true);
             }
         }
 
         private void track(InputStream stream) {
+            boolean close;
             synchronized (lock) {
-                openStream = stream;
+                close = stopped || result.isDone();
+                if (!close) {
+                    openStream = stream;
+                }
             }
-            if (aborted()) {
+            if (close) {
                 closeQuietly(stream);
             }
         }
 
         private CompletableFuture<DecisionsResult> run() {
             return resolve().thenCompose(endpoint -> {
-                DecisionsEndpointPlanner.Plan plan = DecisionsEndpointPlanner.plan(endpoint, request.getModel());
+                requireActive();
+                DecisionsEndpointPlanner.Plan plan = remember(
+                        DecisionsEndpointPlanner.plan(endpoint, request.getModel()));
                 byte[] body;
                 try {
                     body = MAPPER.writeValueAsBytes(DecisionsWire.serialize(request));
@@ -404,12 +567,19 @@ public final class SessionDecisions {
             });
         }
 
+        private DecisionsEndpointPlanner.Plan remember(DecisionsEndpointPlanner.Plan plan) {
+            knownSecrets.addAll(plan.secrets());
+            return new DecisionsEndpointPlanner.Plan(plan.url(), plan.headers(), plan.fingerprint(),
+                    List.copyOf(knownSecrets));
+        }
+
         private CompletableFuture<DecisionsResult> retry(DecisionsEndpointPlanner.Plan plan, byte[] body,
                 DecisionsException original) {
             return resolve().thenCompose(endpoint -> {
+                requireActive();
                 DecisionsEndpointPlanner.Plan refreshed;
                 try {
-                    refreshed = DecisionsEndpointPlanner.plan(endpoint, request.getModel());
+                    refreshed = remember(DecisionsEndpointPlanner.plan(endpoint, request.getModel()));
                 } catch (RuntimeException e) {
                     throw original;
                 }
@@ -430,6 +600,7 @@ public final class SessionDecisions {
             }
             return read(response, MAX_RESPONSE_BYTES, "The Decisions response could not be read.", plan)
                     .thenApply(read -> {
+                        requireActive();
                         if (read.exceeded()) {
                             throw new DecisionsException(DecisionsErrorKind.INVALID_RESPONSE,
                                     "The Decisions API response exceeded " + MAX_RESPONSE_BYTES + " bytes.");
@@ -440,84 +611,122 @@ public final class SessionDecisions {
 
         private CompletableFuture<DecisionsException> readHttpError(HttpResponse<InputStream> response,
                 DecisionsEndpointPlanner.Plan plan) {
-            int window = MAX_ERROR_BODY_BYTES + DecisionsRedaction.maxSecretBytes(plan.secrets());
+            int window = (int) Math.min(Integer.MAX_VALUE - 1L,
+                    (long) MAX_ERROR_BODY_BYTES + DecisionsRedaction.maxSecretBytes(plan.secrets()));
             String requestId = response.headers().firstValue("x-request-id").orElse(null);
-            return read(response, window, "The Decisions error response could not be read.", plan)
-                    .thenApply(read -> httpError(response.statusCode(), requestId,
-                            redactErrorBody(read, plan.secrets()), plan.secrets()));
+            return read(response, window, "The Decisions error response could not be read.", plan).thenApply(
+                    read -> httpError(response.statusCode(), requestId, redactErrorBody(read, plan.secrets()),
+                            plan.secrets(), DecisionsRetryAfter.parse(response.headers(), System.currentTimeMillis())));
         }
 
         private CompletableFuture<Bounded> read(HttpResponse<InputStream> response, int limit, String failureMessage,
                 DecisionsEndpointPlanner.Plan plan) {
             InputStream stream = response.body();
+            requireActive();
             if (stream == null) {
                 return CompletableFuture.completedFuture(new Bounded(new byte[0], false));
             }
-            track(stream);
             CompletableFuture<Bounded> reading = new CompletableFuture<>();
-            try {
-                Readers.EXECUTOR.execute(() -> {
-                    try {
-                        reading.complete(readLimited(stream, limit));
-                    } catch (IOException | RuntimeException e) {
-                        reading.completeExceptionally(e);
-                    } finally {
-                        closeQuietly(stream);
+            Thread thread = new Thread(() -> {
+                Bounded value = null;
+                Throwable failure = null;
+                try {
+                    requireActive();
+                    value = readLimited(stream, limit);
+                } catch (IOException | RuntimeException e) {
+                    failure = e;
+                } finally {
+                    closeQuietly(stream);
+                    synchronized (lock) {
+                        if (openStream == stream) {
+                            openStream = null;
+                        }
                     }
-                });
+                }
+                // Close before completing: continuations may immediately refresh or replay.
+                try {
+                    if (failure == null) {
+                        reading.complete(value);
+                    } else {
+                        reading.completeExceptionally(failure);
+                    }
+                } finally {
+                    synchronized (lock) {
+                        if (reader == Thread.currentThread()) {
+                            reader = null;
+                            bodyRead = null;
+                        }
+                    }
+                }
+            }, "copilot-decisions-reader-" + Readers.COUNTER.incrementAndGet());
+            thread.setDaemon(true);
+            try {
+                synchronized (lock) {
+                    if (stopped || result.isDone()) {
+                        closeQuietly(stream);
+                        reading.cancel(false);
+                    } else {
+                        reader = thread;
+                        bodyRead = reading;
+                        thread.start();
+                    }
+                }
             } catch (RuntimeException e) {
                 closeQuietly(stream);
                 reading.completeExceptionally(e);
             }
             return reading.handle((read, error) -> {
-                if (aborted()) {
-                    throw new CancellationException();
+                Throwable cause = error == null ? null : unwrap(error);
+                if (cause instanceof CancellationException) {
+                    throw cancelled();
                 }
-                if (error != null) {
-                    throw networkError(failureMessage, unwrap(error), plan.secrets());
+                requireActive();
+                if (cause != null) {
+                    throw networkError(failureMessage, cause, plan.secrets());
                 }
                 return read;
             });
         }
 
         private CompletableFuture<SessionProviderGetEndpointResult> resolve() {
-            if (aborted()) {
-                return failed(new CancellationException());
-            }
+            requireActive();
             CompletableFuture<SessionProviderGetEndpointResult> pending;
             try {
-                pending = resolveEndpoint.apply(options.getEndpointModelId());
+                pending = resolveEndpoint.apply(endpointModelId);
                 if (pending == null) {
                     throw new IllegalStateException("The provider endpoint resolver returned no result.");
                 }
             } catch (RuntimeException e) {
-                return failed(endpointUnavailable(e));
+                return failed(e instanceof CancellationException ? cancelled() : endpointUnavailable(e));
             }
-            return pending.handleAsync((endpoint, error) -> {
-                if (aborted()) {
-                    throw new CancellationException();
+            // The RPC protocol cannot cancel an endpoint lookup. Observe its eventual
+            // result, but never dispatch HTTP after cancellation or deadline expiry.
+            return pending.handle((endpoint, error) -> {
+                Throwable cause = error == null ? null : unwrap(error);
+                if (cause instanceof CancellationException) {
+                    throw cancelled();
                 }
-                if (error != null) {
-                    throw endpointUnavailable(unwrap(error));
+                requireActive();
+                if (cause != null) {
+                    throw endpointUnavailable(cause);
                 }
                 return endpoint;
-            }, Readers.EXECUTOR);
+            });
         }
 
         private CompletableFuture<HttpResponse<InputStream>> send(DecisionsEndpointPlanner.Plan plan, byte[] body) {
-            if (aborted()) {
-                return failed(new CancellationException());
-            }
+            requireActive();
             CompletableFuture<HttpResponse<InputStream>> pending;
             HttpRequest httpRequest;
             try {
-                HttpRequest.Builder builder = HttpRequest.newBuilder(URI.create(plan.url()))
-                        .POST(HttpRequest.BodyPublishers.ofByteArray(body));
-                if (options.getTimeout() != null) {
-                    builder.timeout(options.getTimeout());
+                if (customClient) {
+                    httpRequest = new CustomRequest(plan, body);
+                } else {
+                    HttpRequest.Builder builder = HttpRequest.newBuilder(URI.create(plan.url()))
+                            .POST(HttpRequest.BodyPublishers.ofByteArray(body));
+                    plan.headers().forEach(builder::header);
+                    httpRequest = builder.build();
                 }
-                plan.headers().forEach(builder::header);
-                httpRequest = builder.build();
             } catch (IllegalArgumentException e) {
                 // The JDK's message can echo raw header values, which may be credentials too
                 // short to redact.
@@ -526,20 +735,32 @@ public final class SessionDecisions {
                         plan.secrets()));
             }
             try {
+                requireActive();
                 pending = client.sendAsync(httpRequest, HttpResponse.BodyHandlers.ofInputStream());
+                if (pending == null) {
+                    throw new IllegalStateException("The HTTP client returned no future.");
+                }
             } catch (RuntimeException e) {
-                return failed(networkError("The Decisions request could not be sent.", e, plan.secrets()));
+                return failed(e instanceof CancellationException
+                        ? cancelled()
+                        : networkError("The Decisions request could not be sent.", e, plan.secrets()));
             }
             track(pending);
             return pending.handle((response, error) -> {
-                if (aborted()) {
-                    if (response != null) {
-                        closeQuietly(response.body());
-                    }
-                    throw new CancellationException();
+                if (response != null) {
+                    track(response.body());
                 }
-                if (error != null) {
-                    throw networkError("The Decisions request could not be sent.", unwrap(error), plan.secrets());
+                Throwable cause = error == null ? null : unwrap(error);
+                if (cause instanceof CancellationException) {
+                    throw cancelled();
+                }
+                requireActive();
+                if (cause != null) {
+                    throw networkError("The Decisions request could not be sent.", cause, plan.secrets());
+                }
+                if (response == null) {
+                    throw networkError("The Decisions request could not be sent.",
+                            new IOException("The HTTP client returned no response."), plan.secrets());
                 }
                 return response;
             });

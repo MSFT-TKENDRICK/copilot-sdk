@@ -52,8 +52,11 @@
         "vitest": "4.1.11"
     },
     "scripts": {
+        "build": "node scripts/build.mjs",
+        "prepack": "npm run build",
         "typecheck": "tsc --noEmit && tsc --noEmit -p tsconfig.test.json",
-        "test": "vitest run"
+        "test": "vitest run",
+        "test:package": "node scripts/package-smoke/run.mjs"
     },
     "engines": {
         "node": "^20.19.0 || >=22.12.0"
@@ -62,6 +65,7 @@
         "dist/**/*",
         "!dist/tsconfig.tsbuildinfo",
         "docs/**/*",
-        "README.md"
+        "README.md",
+        "LICENSE"
     ]
 }

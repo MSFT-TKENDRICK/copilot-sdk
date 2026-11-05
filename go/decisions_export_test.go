@@ -2,6 +2,8 @@ package copilot
 
 import (
 	"context"
+	"net/http"
+	"time"
 
 	"github.com/github/copilot-sdk/go/rpc"
 )
@@ -36,4 +38,12 @@ func PlanDecisionsAttemptForTest(endpoint *rpc.ProviderEndpoint, model string) (
 
 func ParseDecisionsResultForTest(data []byte) (*DecisionsResult, error) {
 	return parseDecisionsResult(data)
+}
+
+func DecisionsRetryAfterForTest(headers http.Header, now time.Time) *int64 {
+	return decisionsRetryAfter(headers, now)
+}
+
+func SetDecisionsNowForTest(d *SessionDecisions, now time.Time) {
+	d.now = func() time.Time { return now }
 }

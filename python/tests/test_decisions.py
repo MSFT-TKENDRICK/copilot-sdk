@@ -335,6 +335,13 @@ class TestSerialization:
         wire = json.dumps(_serialize_decisions_request(FULL_REQUEST), ensure_ascii=False)
         assert json.loads(wire) == fixture("request.full.json")
 
+    def test_preserves_golden_question_json_part(self):
+        question = fixture("request.full.json")["questions"][2]
+        request = {**MINIMAL_REQUEST, "questions": [question]}
+        assert _serialize_decisions_request(cast(DecisionsRequest, request))["questions"] == [
+            question
+        ]
+
     def test_preserves_bool_vs_string_choice_values(self):
         serialized = _serialize_decisions_request(FULL_REQUEST)
         values = [c["value"] for c in serialized["questions"][2]["choices"]]
@@ -533,7 +540,7 @@ class TestParsing:
 
 class TestVectors:
     @pytest.mark.parametrize("vector", VECTORS["url"], ids=_ids("url"))
-    def test_url(self, vector: dict[str, Any]):
+    def test_url(self, vector: dict[str, Any], record_vector):
         ep = endpoint(vector["endpoint"])
         if vector.get("error"):
             with pytest.raises(DecisionsError) as info:
@@ -542,9 +549,10 @@ class TestVectors:
             assert "secretpassword" not in str(info.value)
         else:
             assert _build_decisions_url(ep) == vector["expected"]
+        record_vector("vectors.json", "url", vector["name"])
 
     @pytest.mark.parametrize("vector", VECTORS["headers"], ids=_ids("headers"))
-    def test_headers(self, vector: dict[str, Any]):
+    def test_headers(self, vector: dict[str, Any], record_vector):
         ep = endpoint(vector["endpoint"])
         if vector.get("error"):
             with pytest.raises(DecisionsError) as info:
@@ -553,19 +561,23 @@ class TestVectors:
         else:
             assert _plan_attempt(ep, "gpt-6-luna").headers == vector["expected"]
             assert _build_decisions_headers(ep) == vector["expected"]
+        record_vector("vectors.json", "headers", vector["name"])
 
     @pytest.mark.parametrize("vector", VECTORS["preflight"], ids=_ids("preflight"))
-    def test_preflight(self, vector: dict[str, Any]):
+    def test_preflight(self, vector: dict[str, Any], record_vector):
         ep = endpoint(vector["endpoint"])
         if vector.get("error"):
             with pytest.raises(DecisionsError) as info:
                 _plan_attempt(ep, vector["model"])
             assert info.value.kind == vector["error"]
         else:
-            _plan_attempt(ep, vector["model"])
+            plan = _plan_attempt(ep, vector["model"])
+            assert plan.url == _build_decisions_url(ep)
+            assert plan.headers == _build_decisions_headers(ep)
+        record_vector("vectors.json", "preflight", vector["name"])
 
     @pytest.mark.parametrize("vector", VECTORS["retry"], ids=_ids("retry"))
-    async def test_retry(self, vector: dict[str, Any]):
+    async def test_retry(self, vector: dict[str, Any], record_vector):
         http = FakeHttp(
             [
                 json_response(401, '{"error":{"type":"auth","code":"expired"}}'),
@@ -587,6 +599,7 @@ class TestVectors:
             assert error.error_code == "expired"
             assert len(http.calls) == 1
         assert len(seen) == 2
+        record_vector("vectors.json", "retry", vector["name"])
 
     async def test_retries_at_most_once(self):
         http = FakeHttp([json_response(403, "{}")])
@@ -604,17 +617,18 @@ class TestVectors:
         assert len(http.calls) == 2
 
     @pytest.mark.parametrize("vector", VECTORS["redactionLength"], ids=_ids("redactionLength"))
-    async def test_redaction_length(self, vector: dict[str, Any]):
-        trimmed = vector["value"].strip()
+    async def test_redaction_length(self, vector: dict[str, Any], record_vector):
+        trimmed = vector["value"].strip(" \t")
         http = FakeHttp([text_response(400, f"echo:{trimmed}:end")])
         api = decisions_with([{**OPENAI_ENDPOINT, "apiKey": vector["value"]}])
         error = await capture_error(api.create(MINIMAL_REQUEST, http_client=http.client))
         assert isinstance(error, DecisionsError)
         expected = "echo:[REDACTED]:end" if vector["isSecret"] else f"echo:{trimmed}:end"
         assert error.body == expected
+        record_vector("vectors.json", "redactionLength", vector["name"])
 
     @pytest.mark.parametrize("vector", VECTORS["redaction"], ids=_ids("redaction"))
-    async def test_redaction(self, vector: dict[str, Any]):
+    async def test_redaction(self, vector: dict[str, Any], record_vector):
         prefix = vector.get("bodyPrefix")
         body = vector["body"]
         repeat = vector.get("bodyRepeat")
@@ -651,6 +665,7 @@ class TestVectors:
             assert secret not in surfaces
         if not error.body_truncated:
             assert "[REDACTED]" in (error.body or "")
+        record_vector("vectors.json", "redaction", vector["name"])
 
 
 # ---------------------------------------------------------------------------
@@ -914,7 +929,9 @@ class TestCreate:
         assert isinstance(other_error, DecisionsError)
         assert other_error.kind == "endpointUnavailable"
         assert "COPILOT_ALLOW_GET_PROVIDER_ENDPOINT" not in str(other_error)
-        assert isinstance(other_error.__cause__, RuntimeError)
+        assert isinstance(other_error.__cause__, DecisionsTransportErrorCause)
+        assert other_error.__cause__.name == "EndpointResolutionError"
+        assert other_error.__context__ is None
 
     async def test_rejects_unsupported_providers_before_sending(self):
         http = FakeHttp([json_response(200, OK_BODY)])
@@ -981,7 +998,7 @@ class TestCancellation:
         assert isinstance(error, asyncio.CancelledError)
         assert not isinstance(error, DecisionsError)
 
-    async def test_timeout_raises_timeout_error(self):
+    async def test_timeout_raises_decisions_timeout_error(self):
         async def hang(_request: httpx.Request) -> httpx.Response:
             await asyncio.Event().wait()
             raise AssertionError("unreachable")
@@ -992,8 +1009,10 @@ class TestCancellation:
                 MINIMAL_REQUEST, timeout=0.05, http_client=http.client
             )
         )
-        assert isinstance(error, TimeoutError)
-        assert not isinstance(error, DecisionsError)
+        assert isinstance(error, DecisionsError)
+        assert error.kind == "timeout"
+        assert error.__cause__ is None
+        assert error.__context__ is None
 
 
 # ---------------------------------------------------------------------------
@@ -1023,7 +1042,7 @@ class _Server:
 
             do_GET = do_POST  # noqa: N815
 
-            def log_message(self, *args: Any) -> None:
+            def log_message(self, format: str, *args: Any) -> None:
                 pass
 
         self.httpd = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
@@ -1151,7 +1170,7 @@ class TestPublicApi:
 
         session = object.__new__(CopilotSession)
         session._decisions = None  # type: ignore[attr-defined]
-        session._rpc = FakeRpc()  # type: ignore[attr-defined]
+        session._rpc = cast(Any, FakeRpc())
         first = session.decisions
         assert first is session.decisions
         http = FakeHttp([json_response(200, OK_BODY)])

@@ -12,6 +12,8 @@ use tokio::net::TcpListener;
 
 use super::*;
 
+mod production;
+
 // ============================================================================
 // Fixtures
 // ============================================================================
@@ -38,6 +40,32 @@ fn vectors(group: &str) -> Vec<Value> {
         .clone();
     assert!(!list.is_empty(), "vector group '{group}' is empty");
     list
+}
+
+fn record_vector(file: &str, group: &str, vector: &Value) {
+    let Some(path) = std::env::var_os("COPILOT_DECISIONS_VECTOR_CENSUS") else {
+        return;
+    };
+    static PASSED: Mutex<Vec<Value>> = Mutex::new(Vec::new());
+    let name = vector["name"].as_str().expect("case name");
+    let mut passed = PASSED.lock().unwrap();
+    assert!(
+        !passed
+            .iter()
+            .any(|case| { case["file"] == file && case["group"] == group && case["name"] == name }),
+        "duplicate census identity"
+    );
+    passed.push(json!({"file": file, "group": group, "name": name, "status": "passed"}));
+    let mut cases = passed.clone();
+    cases.sort_by_key(|case| {
+        (
+            case["file"].as_str().unwrap().to_owned(),
+            case["group"].as_str().unwrap().to_owned(),
+            case["name"].as_str().unwrap().to_owned(),
+        )
+    });
+    let census = json!({"sdk": "rust", "schemaVersion": 1, "cases": cases});
+    std::fs::write(path, serde_json::to_vec_pretty(&census).unwrap()).expect("write passed census");
 }
 
 fn endpoint(value: &Value) -> ProviderEndpoint {
@@ -343,6 +371,7 @@ fn response(status: u16, body: impl Into<Vec<u8>>) -> InboundResponse {
     InboundResponse {
         status,
         request_id: None,
+        retry_after_ms: None,
         body: body_stream(body),
     }
 }
@@ -423,6 +452,7 @@ async fn run(
         transport,
         request,
         endpoint_model_id,
+        Some(DEFAULT_TIMEOUT),
     ))
     .await
 }
@@ -716,6 +746,7 @@ fn vectors_url() {
                 "{name}"
             ),
         }
+        record_vector("vectors.json", "url", &v);
     }
 }
 
@@ -745,6 +776,7 @@ fn vectors_headers() {
                 assert_eq!(built, expected, "{name}");
             }
         }
+        record_vector("vectors.json", "headers", &v);
     }
 }
 
@@ -767,6 +799,7 @@ fn vectors_preflight() {
                 }
             }
         }
+        record_vector("vectors.json", "preflight", &v);
     }
 }
 
@@ -798,6 +831,7 @@ async fn vectors_retry() {
             assert_eq!(transport.call_count(), 1, "{name}");
         }
         assert_eq!(resolver.seen().len(), 2, "{name}");
+        record_vector("vectors.json", "retry", &v);
     }
 }
 
@@ -831,6 +865,7 @@ async fn vectors_redaction_length() {
             format!("echo:{trimmed}:end")
         };
         assert_eq!(details(&error).body(), Some(expected.as_str()), "{name}");
+        record_vector("vectors.json", "redactionLength", &v);
     }
 }
 
@@ -887,6 +922,7 @@ async fn vectors_redaction() {
         if d.body_truncated() != Some(true) {
             assert!(d.body().unwrap().contains(REDACTED), "{name}");
         }
+        record_vector("vectors.json", "redaction", &v);
     }
 }
 
@@ -1150,6 +1186,7 @@ async fn drains_401_body_before_retrying() {
         InboundResponse {
             status: 401,
             request_id: None,
+            retry_after_ms: None,
             body: stream::once(async move {
                 events.lock().unwrap().push("read".into());
                 Ok(Bytes::from_static(b"{}"))
@@ -1176,6 +1213,7 @@ async fn cancels_oversized_error_bodies() {
         InboundResponse {
             status: 500,
             request_id: None,
+            retry_after_ms: None,
             body: stream::unfold(guard, |guard| async move {
                 Some((Ok(Bytes::from(vec![b'x'; 16 * 1024])), guard))
             })
@@ -1197,6 +1235,7 @@ async fn maps_mid_body_failures_to_network() {
         let responder: Responder = Arc::new(move |_| InboundResponse {
             status,
             request_id: None,
+            retry_after_ms: None,
             body: stream::iter(vec![
                 Ok(Bytes::from_static(b"{\"answers\":")),
                 Err(BoxError::from("socket hang up")),
@@ -1227,7 +1266,7 @@ async fn caps_success_bodies() {
 }
 
 #[tokio::test]
-async fn surfaces_gate_hint_only_when_runtime_mentions_it() {
+async fn endpoint_failures_use_a_fixed_hint_without_a_raw_cause() {
     let transport = FakeTransport::new(vec![respond(200, ok_body())]);
     let gated = Resolver::script(vec![Box::new(|| {
         Err(Error::with_message(
@@ -1252,9 +1291,9 @@ async fn surfaces_gate_hint_only_when_runtime_mentions_it() {
     let error = run_err(&other, &transport, &minimal_request()).await;
     assert_eq!(kind_of(&error), "endpointUnavailable");
     let d = details(&error);
-    assert!(!d.message().contains("COPILOT_ALLOW_GET_PROVIDER_ENDPOINT"));
-    let cause = std::error::Error::source(d).expect("cause");
-    assert!(cause.downcast_ref::<Error>().is_some());
+    assert!(d.message().contains("COPILOT_ALLOW_GET_PROVIDER_ENDPOINT"));
+    assert!(std::error::Error::source(d).is_none());
+    assert!(!format!("{error:?}").contains("Session not found"));
     assert_eq!(transport.call_count(), 0);
 }
 
@@ -1267,6 +1306,7 @@ async fn cancellation_by_drop_aborts_the_request() {
         InboundResponse {
             status: 200,
             request_id: None,
+            retry_after_ms: None,
             body: stream::unfold(guard, |guard| async move {
                 std::future::pending::<()>().await;
                 Some((Ok(Bytes::new()), guard))

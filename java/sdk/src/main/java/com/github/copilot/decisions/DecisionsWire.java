@@ -4,6 +4,7 @@
 
 package com.github.copilot.decisions;
 
+import java.math.BigDecimal;
 import java.util.ArrayList;
 import java.util.List;
 
@@ -19,6 +20,11 @@ import com.fasterxml.jackson.databind.node.ObjectNode;
 final class DecisionsWire {
 
     private static final JsonNodeFactory NODES = JsonNodeFactory.instance;
+    private static final BigDecimal MAX_FLOAT_INTEGER = BigDecimal.valueOf(9007199254740991L);
+
+    private enum ContentPosition {
+        USER, DEVELOPER, ASSISTANT, TOOL, QUESTION
+    }
 
     private DecisionsWire() {
     }
@@ -64,28 +70,45 @@ final class DecisionsWire {
         }
     }
 
-    private static JsonNode serializeContent(DecisionsContent<?> content) {
+    private static JsonNode serializeContent(DecisionsContent<?> content, ContentPosition position) {
         if (content.text() != null) {
             return NODES.textNode(content.text());
         }
         ArrayNode parts = NODES.arrayNode();
-        for (DecisionsContentPart part : content.parts()) {
-            parts.add(serializePart(part));
+        for (Object value : content.parts()) {
+            if (!(value instanceof DecisionsContentPart part) || !allowedPart(part, position)) {
+                throw new IllegalArgumentException("Invalid Decisions content part for this position.");
+            }
+            parts.add(serializePart(part, position != ContentPosition.QUESTION));
         }
         return parts;
     }
 
-    private static ObjectNode serializePart(DecisionsContentPart part) {
+    private static boolean allowedPart(DecisionsContentPart part, ContentPosition position) {
+        return switch (position) {
+            case USER -> part instanceof DecisionsContentPart.UserPart;
+            case DEVELOPER -> part instanceof DecisionsContentPart.DeveloperPart;
+            case ASSISTANT -> part instanceof DecisionsContentPart.AssistantPart;
+            case TOOL -> part instanceof DecisionsContentPart.ToolOutputPart;
+            case QUESTION -> part instanceof DecisionsContentPart.QuestionPart;
+        };
+    }
+
+    private static ObjectNode serializePart(DecisionsContentPart part, boolean includeBreakpoint) {
         ObjectNode out = NODES.objectNode();
         if (part instanceof DecisionsContentPart.InputText p) {
             out.put("type", "input_text");
             out.put("text", p.text());
-            putBreakpoint(out, p.promptCacheBreakpoint());
+            if (includeBreakpoint) {
+                putBreakpoint(out, p.promptCacheBreakpoint());
+            }
         } else if (part instanceof DecisionsContentPart.InputImage p) {
             out.put("type", "input_image");
             out.put("image_url", p.imageUrl());
             putIfPresent(out, "detail", p.detail());
-            putBreakpoint(out, p.promptCacheBreakpoint());
+            if (includeBreakpoint) {
+                putBreakpoint(out, p.promptCacheBreakpoint());
+            }
         } else if (part instanceof DecisionsContentPart.InputJson p) {
             out.put("type", "input_json");
             out.set("data", p.data());
@@ -96,7 +119,7 @@ final class DecisionsWire {
             out.put("type", "refusal");
             out.put("refusal", p.refusal());
         } else {
-            throw new IllegalArgumentException("Unsupported Decisions content part: " + part);
+            throw new IllegalArgumentException("Unsupported Decisions content part.");
         }
         return out;
     }
@@ -113,7 +136,13 @@ final class DecisionsWire {
             out.put("type", "message");
         }
         out.put("role", role);
-        out.set("content", serializeContent(content));
+        ContentPosition position = switch (role) {
+            case "user" -> ContentPosition.USER;
+            case "developer", "system" -> ContentPosition.DEVELOPER;
+            case "assistant" -> ContentPosition.ASSISTANT;
+            default -> throw new IllegalArgumentException("Unsupported Decisions message role.");
+        };
+        out.set("content", serializeContent(content, position));
         return out;
     }
 
@@ -152,17 +181,17 @@ final class DecisionsWire {
         } else if (item instanceof DecisionsInputItem.FunctionCallOutput o) {
             out.put("type", "function_call_output");
             out.put("call_id", o.callId());
-            out.set("output", serializeContent(o.output()));
+            out.set("output", serializeContent(o.output(), ContentPosition.TOOL));
             putIfPresent(out, "id", o.id());
             putIfPresent(out, "status", o.status());
         } else if (item instanceof DecisionsInputItem.CustomToolCallOutput o) {
             out.put("type", "custom_tool_call_output");
             out.put("call_id", o.callId());
-            out.set("output", serializeContent(o.output()));
+            out.set("output", serializeContent(o.output(), ContentPosition.TOOL));
             putIfPresent(out, "id", o.id());
             putIfPresent(out, "status", o.status());
         } else {
-            throw new IllegalArgumentException("Unsupported Decisions input item: " + item);
+            throw new IllegalArgumentException("Unsupported Decisions input item.");
         }
         return out;
     }
@@ -177,11 +206,11 @@ final class DecisionsWire {
         } else if (question instanceof DecisionsQuestion.Score) {
             type = "score";
         } else {
-            throw new IllegalArgumentException("Unsupported Decisions question: " + question);
+            throw new IllegalArgumentException("Unsupported Decisions question.");
         }
         out.put("type", type);
         putIfPresent(out, "name", question.name());
-        out.set("instructions", serializeContent(question.instructions()));
+        out.set("instructions", serializeContent(question.instructions(), ContentPosition.QUESTION));
         if (question instanceof DecisionsQuestion.Choice choice) {
             ArrayNode choices = out.putArray("choices");
             for (DecisionsQuestion.ChoiceOption option : choice.choices()) {
@@ -263,14 +292,40 @@ final class DecisionsWire {
             return 0;
         }
         JsonNode value = obj.get(key);
-        if (value == null || value.isNull()) {
+        if (value == null) {
             return 0;
         }
-        double d = num(obj, key);
-        if (d != Math.floor(d)) {
-            throw new InvalidResponse("Expected integer '" + key + "'.");
+        return integer(obj, key);
+    }
+
+    private static long integer(JsonNode obj, String key) {
+        JsonNode value = obj.get(key);
+        if (value == null || !value.isNumber()) {
+            throw new InvalidResponse("Expected signed integer '" + key + "'.");
         }
-        return value.isIntegralNumber() ? value.longValue() : (long) d;
+        if (value.isIntegralNumber()) {
+            if (value.canConvertToLong()) {
+                return value.longValue();
+            }
+        } else {
+            try {
+                BigDecimal decimal = value.decimalValue();
+                if (decimal.abs().compareTo(MAX_FLOAT_INTEGER) <= 0) {
+                    return decimal.longValueExact();
+                }
+            } catch (ArithmeticException | NumberFormatException e) {
+                throw new InvalidResponse("Expected signed integer '" + key + "'.");
+            }
+        }
+        throw new InvalidResponse("Expected signed integer '" + key + "'.");
+    }
+
+    private static double probability(JsonNode obj, String key) {
+        double value = num(obj, key);
+        if (value < 0 || value > 1) {
+            throw new InvalidResponse("Expected probability '" + key + "' between zero and one.");
+        }
+        return value;
     }
 
     private static String str(JsonNode obj, String key) {
@@ -323,28 +378,24 @@ final class DecisionsWire {
         String name = answerName(obj);
         switch (type) {
             case "predicate" :
-                return new DecisionsAnswer.Predicate(name, num(obj, "probability"));
+                return new DecisionsAnswer.Predicate(name, probability(obj, "probability"));
             case "choice" : {
                 DecisionsChoiceValue choice = choiceValue(obj, "choice");
-                double confidence = num(obj, "confidence");
+                double confidence = probability(obj, "confidence");
                 List<DecisionsAnswer.ChoiceProbability> probabilities = new ArrayList<>();
                 for (JsonNode p : arr(obj, "probabilities")) {
-                    probabilities
-                            .add(new DecisionsAnswer.ChoiceProbability(choiceValue(p, "value"), num(p, "probability")));
+                    probabilities.add(new DecisionsAnswer.ChoiceProbability(choiceValue(p, "value"),
+                            probability(p, "probability")));
                 }
                 return new DecisionsAnswer.Choice(name, choice, confidence, probabilities);
             }
             case "score" : {
                 double score = num(obj, "score");
-                double confidence = num(obj, "confidence");
+                double confidence = probability(obj, "confidence");
                 List<DecisionsAnswer.ScoreProbability> probabilities = new ArrayList<>();
                 for (JsonNode p : arr(obj, "probabilities")) {
-                    double value = num(p, "value");
-                    if (value != Math.floor(value)) {
-                        throw new InvalidResponse("Expected integer level 'value'.");
-                    }
-                    probabilities.add(
-                            new DecisionsAnswer.ScoreProbability(str(p, "label"), (long) value, num(p, "probability")));
+                    probabilities.add(new DecisionsAnswer.ScoreProbability(str(p, "label"), integer(p, "value"),
+                            probability(p, "probability")));
                 }
                 return new DecisionsAnswer.Score(name, score, confidence, probabilities);
             }

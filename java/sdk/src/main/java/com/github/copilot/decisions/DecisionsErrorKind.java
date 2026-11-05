@@ -29,6 +29,8 @@ public enum DecisionsErrorKind {
     HTTP("http"),
     /** The Decisions API returned a response that could not be parsed. */
     INVALID_RESPONSE("invalidResponse"),
+    /** The SDK-owned total-call deadline expired. */
+    TIMEOUT("timeout"),
     /** The request could not be sent or the response could not be read. */
     NETWORK("network");
 

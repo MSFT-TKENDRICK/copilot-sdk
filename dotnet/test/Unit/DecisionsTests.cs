@@ -14,7 +14,7 @@ using Xunit;
 
 namespace GitHub.Copilot.Test.Unit;
 
-public sealed class DecisionsTests
+public sealed partial class DecisionsTests
 {
     private const int MaxErrorBodyBytes = 64 * 1024;
     private const int MaxResponseBytes = 8 * 1024 * 1024;
@@ -337,7 +337,7 @@ public sealed class DecisionsTests
         var score = Assert.IsType<DecisionsScoreAnswer>(result.Answers[3]);
         Assert.Equal("severity", score.Name);
         Assert.Equal(1.37, score.Score);
-        Assert.Equal([0, 1, 2], score.Probabilities.Select(p => p.Value));
+        Assert.Equal([0L, 1L, 2L], score.Probabilities.Select(p => p.Value));
         Assert.Equal(["low", "medium", "high"], score.Probabilities.Select(p => p.Label));
 
         Assert.Equal(new DecisionsRefusalAnswer("pii_check"), result.Answers[4]);
@@ -402,12 +402,12 @@ public sealed class DecisionsTests
     [Fact]
     public void Vector_Groups_Are_All_Present()
     {
-        Assert.Equal(19, UrlVectors.Cast<object>().Count());
-        Assert.Equal(18, HeaderVectors.Cast<object>().Count());
+        Assert.Equal(32, UrlVectors.Cast<object>().Count());
+        Assert.Equal(21, HeaderVectors.Cast<object>().Count());
         Assert.Equal(7, PreflightVectors.Cast<object>().Count());
         Assert.Equal(10, RetryVectors.Cast<object>().Count());
-        Assert.Equal(9, RedactionVectors.Cast<object>().Count());
-        Assert.Equal(3, RedactionLengthVectors.Cast<object>().Count());
+        Assert.Equal(12, RedactionVectors.Cast<object>().Count());
+        Assert.Equal(4, RedactionLengthVectors.Cast<object>().Count());
     }
 
     [Theory]
@@ -432,6 +432,8 @@ public sealed class DecisionsTests
             await create;
             Assert.Equal(vector.GetProperty("expected").GetString(), Assert.Single(http.Calls).Url);
         }
+
+        Fixtures.RecordPassed("url", name);
     }
 
     [Theory]
@@ -455,6 +457,8 @@ public sealed class DecisionsTests
             var expected = vector.GetProperty("expected").EnumerateObject().ToDictionary(p => p.Name, p => p.Value.GetString()!);
             AssertHeaders(expected, Assert.Single(http.Calls).Headers);
         }
+
+        Fixtures.RecordPassed("headers", name);
     }
 
     [Theory]
@@ -480,6 +484,8 @@ public sealed class DecisionsTests
             await create;
             Assert.Single(http.Calls);
         }
+
+        Fixtures.RecordPassed("preflight", name);
     }
 
     [Theory]
@@ -513,6 +519,7 @@ public sealed class DecisionsTests
         }
 
         Assert.Equal(2, runtime.GetEndpointCalls.Length);
+        Fixtures.RecordPassed("retry", name);
     }
 
     [Theory]
@@ -579,6 +586,9 @@ public sealed class DecisionsTests
             Assert.True(Encoding.UTF8.GetByteCount(error.Body!) <= MaxErrorBodyBytes);
             Assert.False(error.Body!.EndsWith('\uFFFD'), "Split trailing character must be dropped, not replaced.");
         }
+
+        Assert.True(Encoding.UTF8.GetByteCount(error.Message) <= MaxErrorBodyBytes);
+        Fixtures.RecordPassed("redaction", name);
     }
 
     [Theory]
@@ -595,6 +605,7 @@ public sealed class DecisionsTests
             () => runtime.Session.Decisions.CreateAsync(MinimalRequest(), new DecisionsOptions { Handler = http }));
 
         Assert.Equal(vector.GetProperty("isSecret").GetBoolean() ? "echo:[REDACTED]:end" : echoed, error.Body);
+        Fixtures.RecordPassed("redactionLength", name);
     }
 
     // ------------------------------------------------------------------
@@ -813,7 +824,7 @@ public sealed class DecisionsTests
             () => runtime.Session.Decisions.CreateAsync(MinimalRequest(), new DecisionsOptions { Handler = http }));
 
         Assert.Equal(DecisionsErrorKind.EndpointUnavailable, error.Kind);
-        Assert.NotNull(error.InnerException);
+        Assert.Null(error.InnerException);
         Assert.Single(http.Calls);
     }
 
@@ -878,7 +889,7 @@ public sealed class DecisionsTests
             var error = await Assert.ThrowsAsync<DecisionsException>(() => other.Session.Decisions.CreateAsync(MinimalRequest()));
             Assert.Equal(DecisionsErrorKind.EndpointUnavailable, error.Kind);
             Assert.DoesNotContain("COPILOT_ALLOW_GET_PROVIDER_ENDPOINT", error.Message, StringComparison.Ordinal);
-            Assert.NotNull(error.InnerException);
+            Assert.Null(error.InnerException);
         }
     }
 
@@ -1106,15 +1117,18 @@ public sealed class DecisionsTests
     {
         private static readonly Lazy<string> s_directory = new(FindDirectory);
         private static readonly Lazy<JsonElement> s_vectors = new(() => DecisionsTests.Json(Text("vectors.json")));
+        private static readonly Lazy<JsonElement> s_production = new(() => DecisionsTests.Json(Text("production-vectors.json")));
+        private static readonly HashSet<(string File, string Group, string Name)> s_passed = [];
+        private static readonly object s_censusLock = new();
 
         public static string Text(string name) => File.ReadAllText(Path.Combine(s_directory.Value, name));
 
         public static JsonElement Json(string name) => DecisionsTests.Json(Text(name));
 
-        public static TheoryData<string> VectorNames(string group)
+        public static TheoryData<string> VectorNames(string group, string file = "vectors.json")
         {
             var data = new TheoryData<string>();
-            foreach (var vector in s_vectors.Value.GetProperty(group).EnumerateArray())
+            foreach (var vector in Vectors(file).GetProperty(group).EnumerateArray())
             {
                 data.Add(vector.GetProperty("name").GetString()!);
             }
@@ -1122,8 +1136,52 @@ public sealed class DecisionsTests
             return data;
         }
 
-        public static JsonElement Vector(string group, string name) =>
-            s_vectors.Value.GetProperty(group).EnumerateArray().Single(v => v.GetProperty("name").GetString() == name);
+        public static JsonElement Vector(string group, string name, string file = "vectors.json") =>
+            Vectors(file).GetProperty(group).EnumerateArray().Single(v => v.GetProperty("name").GetString() == name);
+
+        private static JsonElement Vectors(string file) => file switch
+        {
+            "vectors.json" => s_vectors.Value,
+            "production-vectors.json" => s_production.Value,
+            _ => throw new ArgumentException("Unknown vector file.", nameof(file)),
+        };
+
+        public static void RecordPassed(string group, string name, string file = "vectors.json")
+        {
+            var path = Environment.GetEnvironmentVariable("COPILOT_DECISIONS_VECTOR_CENSUS");
+            if (string.IsNullOrEmpty(path))
+            {
+                return;
+            }
+
+            lock (s_censusLock)
+            {
+                s_passed.Add((file, group, name));
+                using var buffer = new MemoryStream();
+                using (var writer = new Utf8JsonWriter(buffer))
+                {
+                    writer.WriteStartObject();
+                    writer.WriteString("sdk", "dotnet");
+                    writer.WriteNumber("schemaVersion", 1);
+                    writer.WriteStartArray("cases");
+                    foreach (var entry in s_passed.OrderBy(v => v.File, StringComparer.Ordinal)
+                        .ThenBy(v => v.Group, StringComparer.Ordinal).ThenBy(v => v.Name, StringComparer.Ordinal))
+                    {
+                        writer.WriteStartObject();
+                        writer.WriteString("file", entry.File);
+                        writer.WriteString("group", entry.Group);
+                        writer.WriteString("name", entry.Name);
+                        writer.WriteString("status", "passed");
+                        writer.WriteEndObject();
+                    }
+
+                    writer.WriteEndArray();
+                    writer.WriteEndObject();
+                }
+
+                File.WriteAllBytes(path, buffer.ToArray());
+            }
+        }
 
         private static string FindDirectory()
         {
@@ -1147,6 +1205,8 @@ public sealed class DecisionsTests
         private readonly Func<HttpRequestMessage, CancellationToken, Task<HttpResponseMessage>>[] _responses;
         private readonly List<RecordedCall> _calls = [];
         private int _index;
+
+        public bool Disposed { get; private set; }
 
         public ScriptedHandler(params Func<HttpRequestMessage, HttpResponseMessage>[] responses)
         {
@@ -1201,6 +1261,12 @@ public sealed class DecisionsTests
             response.RequestMessage = request;
             return response;
         }
+
+        protected override void Dispose(bool disposing)
+        {
+            Disposed = true;
+            base.Dispose(disposing);
+        }
     }
 
     private sealed class PassThroughHandler(HttpMessageHandler inner) : DelegatingHandler(inner);
@@ -1250,6 +1316,8 @@ public sealed class DecisionsTests
     {
         private bool _sent;
 
+        public bool Disposed { get; private set; }
+
         public override bool CanRead => true;
 
         public override bool CanSeek => false;
@@ -1282,10 +1350,18 @@ public sealed class DecisionsTests
         public override void SetLength(long value) => throw new NotSupportedException();
 
         public override void Write(byte[] buffer, int offset, int count) => throw new NotSupportedException();
+
+        protected override void Dispose(bool disposing)
+        {
+            Disposed = true;
+            base.Dispose(disposing);
+        }
     }
 
     private sealed class TrackingStream(byte[] data, Action onRead) : MemoryStream(data)
     {
+        public bool Disposed { get; private set; }
+
         public override int Read(byte[] buffer, int offset, int count)
         {
             onRead();
@@ -1309,6 +1385,12 @@ public sealed class DecisionsTests
             onRead();
             return base.ReadAsync(buffer, cancellationToken);
         }
+
+        protected override void Dispose(bool disposing)
+        {
+            Disposed = true;
+            base.Dispose(disposing);
+        }
     }
 
     private sealed class RpcFailure(string message) : Exception(message);
@@ -1317,14 +1399,14 @@ public sealed class DecisionsTests
     private sealed class FakeRuntime : IAsyncDisposable
     {
         private readonly TcpListener _listener;
-        private readonly Func<int, string> _getEndpoint;
+        private readonly Func<int, CancellationToken, Task<string>> _getEndpoint;
         private readonly CancellationTokenSource _cts = new();
         private readonly List<JsonElement> _getEndpointCalls = [];
         private readonly Task _serverTask;
         private CopilotClient? _client;
         private CopilotSession? _session;
 
-        private FakeRuntime(TcpListener listener, Func<int, string> getEndpoint)
+        private FakeRuntime(TcpListener listener, Func<int, CancellationToken, Task<string>> getEndpoint)
         {
             _listener = listener;
             _getEndpoint = getEndpoint;
@@ -1347,7 +1429,10 @@ public sealed class DecisionsTests
         public static Task<FakeRuntime> StartAsync(params string[] endpoints) =>
             StartAsync(call => endpoints[Math.Min(call, endpoints.Length) - 1]);
 
-        public static async Task<FakeRuntime> StartAsync(Func<int, string> getEndpoint)
+        public static Task<FakeRuntime> StartAsync(Func<int, string> getEndpoint) =>
+            StartAsync((call, _) => Task.FromResult(getEndpoint(call)));
+
+        public static async Task<FakeRuntime> StartAsync(Func<int, CancellationToken, Task<string>> getEndpoint)
         {
             var listener = new TcpListener(IPAddress.Loopback, 0);
             listener.Start();
@@ -1413,7 +1498,7 @@ public sealed class DecisionsTests
                         "connect" => """{"ok":true,"protocolVersion":3,"version":"test"}""",
                         "session.create" => $$"""{"sessionId":{{JsonString(parameters.TryGetProperty("sessionId", out var sid) && sid.ValueKind == JsonValueKind.String ? sid.GetString()! : Guid.NewGuid().ToString())}},"workspacePath":null,"capabilities":null}""",
                         "session.detach" => """{"success":true}""",
-                        "session.provider.getEndpoint" => GetEndpoint(parameters),
+                        "session.provider.getEndpoint" => await GetEndpointAsync(parameters, _cts.Token),
                         _ => "{}",
                     };
                 }
@@ -1430,7 +1515,7 @@ public sealed class DecisionsTests
             }
         }
 
-        private string GetEndpoint(JsonElement parameters)
+        private Task<string> GetEndpointAsync(JsonElement parameters, CancellationToken cancellationToken)
         {
             int call;
             lock (_getEndpointCalls)
@@ -1439,7 +1524,7 @@ public sealed class DecisionsTests
                 call = _getEndpointCalls.Count;
             }
 
-            return _getEndpoint(call);
+            return _getEndpoint(call, cancellationToken);
         }
 
         private static async Task WriteAsync(Stream stream, string json, CancellationToken cancellationToken)
@@ -1489,7 +1574,7 @@ public sealed class DecisionsTests
 
         public string BaseUrl => $"http://127.0.0.1:{((IPEndPoint)_listener.LocalEndpoint).Port}/v1";
 
-        public IReadOnlyList<HttpHit> Hits
+        public HttpHit[] Hits
         {
             get
             {

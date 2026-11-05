@@ -13,7 +13,7 @@ import com.github.copilot.CopilotExperimental;
  * @param mode
  *            optional mode: {@code "implicit"} or {@code "explicit"}
  * @param ttl
- *            optional time-to-live: {@code "5m"} or {@code "1h"}
+ *            optional time-to-live: {@code "30m"} is the documented value
  * @since 1.0.0
  */
 @CopilotExperimental

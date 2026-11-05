@@ -11,6 +11,11 @@
  * @module decisions
  */
 
+import { request as httpRequest } from "node:http";
+import { request as httpsRequest } from "node:https";
+import { isIP } from "node:net";
+import { pipeline, Readable } from "node:stream";
+import { createBrotliDecompress, createGunzip, createInflate } from "node:zlib";
 import type { ProviderEndpoint, SessionProviderGetEndpointRequest } from "./generated/rpc.js";
 
 // ============================================================================
@@ -88,21 +93,21 @@ export type DecisionsItemStatus = "in_progress" | "completed" | "incomplete";
 
 /** @experimental Part of the experimental Decisions API surface and may change or be removed. */
 export interface DecisionsUserMessage {
-    type?: "message";
+    type?: "message" | null;
     role: "user";
     content: string | (DecisionsInputText | DecisionsInputImage | DecisionsInputJson)[];
 }
 
 /** @experimental Part of the experimental Decisions API surface and may change or be removed. */
 export interface DecisionsDeveloperMessage {
-    type?: "message";
+    type?: "message" | null;
     role: "developer" | "system";
     content: string | DecisionsInputText[];
 }
 
 /** @experimental Part of the experimental Decisions API surface and may change or be removed. */
 export interface DecisionsAssistantMessage {
-    type?: "message";
+    type?: "message" | null;
     role: "assistant";
     content: string | (DecisionsOutputText | DecisionsRefusalContent)[];
     phase?: "commentary" | "final_answer" | null;
@@ -260,10 +265,16 @@ export interface DecisionsRequest {
  */
 export interface DecisionsCallOptions {
     /**
-     * Cancels the call. The runtime `getEndpoint` RPC itself cannot be aborted; the signal is
-     * checked before and after it and is passed to `fetch`.
+     * Cancels the entire call with the caller's native abort reason. A pending endpoint RPC
+     * cannot itself be cancelled, but the SDK stops waiting and observes its eventual outcome.
      */
     signal?: AbortSignal;
+    /**
+     * Total-call deadline in milliseconds, including endpoint resolution, bodies, and replay.
+     * Defaults to 600000 (ten minutes). Set to null to disable; otherwise must be finite and
+     * positive. SDK deadline expiry raises DecisionsError with kind "timeout".
+     */
+    timeoutMs?: number | null;
     /**
      * Passed verbatim as `modelId` to `session.provider.getEndpoint`. Omit to use the session's
      * current endpoint. This is never derived from `request.model`.
@@ -271,7 +282,8 @@ export interface DecisionsCallOptions {
     endpointModelId?: string;
     /**
      * Custom fetch implementation (proxying, testing). Injected implementations are trusted and
-     * must provide their own redirect protection; the SDK passes `redirect: "manual"`.
+     * own their redirect and TLS policy; the SDK passes `redirect: "manual"` and an abort signal.
+     * An injected transport's independent timeout is a network error, not the SDK deadline.
      */
     fetch?: typeof fetch;
 }
@@ -305,7 +317,7 @@ export interface DecisionsChoiceAnswer {
 /** @experimental Part of the experimental Decisions API surface and may change or be removed. */
 export interface DecisionsScoreProbability {
     label: string;
-    /** Integer index of the level. */
+    /** Signed safe-integer index of the level (including provider sentinels). */
     value: number;
     probability: number;
 }
@@ -347,7 +359,10 @@ export type DecisionsAnswer =
     | DecisionsRefusalAnswer
     | DecisionsUnknownAnswer;
 
-/** @experimental Part of the experimental Decisions API surface and may change or be removed. */
+/**
+ * Usage counters are signed JavaScript safe integers; absent counters default to zero.
+ * @experimental Part of the experimental Decisions API surface and may change or be removed.
+ */
 export interface DecisionsUsage {
     inputTokens: number;
     inputTokensDetails: { cachedTokens: number; cacheWriteTokens: number };
@@ -382,7 +397,8 @@ export type DecisionsErrorKind =
     | "credentialConflict"
     | "http"
     | "invalidResponse"
-    | "network";
+    | "network"
+    | "timeout";
 
 /** @experimental Part of the experimental Decisions API surface and may change or be removed. */
 export interface DecisionsErrorDetails {
@@ -393,12 +409,14 @@ export interface DecisionsErrorDetails {
     requestId?: string;
     body?: string;
     bodyTruncated?: boolean;
+    retryAfterMs?: number;
     cause?: unknown;
 }
 
 /**
- * Error raised by `session.decisions.create`. Messages and `body` never contain credentials.
- * Cancellation is reported with the platform's native abort error, not this type.
+ * Error raised by `session.decisions.create`. Retained diagnostics redact known endpoint
+ * credentials and their supported wire encodings, not arbitrary transformations or general PII.
+ * Caller cancellation retains its native reason; only the SDK deadline uses kind "timeout".
  *
  * @experimental Part of the experimental Decisions API surface and may change or be removed.
  */
@@ -412,12 +430,14 @@ export class DecisionsError extends Error {
     readonly errorCode?: string;
     /** OpenAI error `param`, when the error body was parsable. */
     readonly errorParam?: string;
-    /** Value of the `x-request-id` response header. */
+    /** Bounded, credential-redacted value of the `x-request-id` response header. */
     readonly requestId?: string;
     /** Response body (at most 64 KiB, credentials redacted). */
     readonly body?: string;
-    /** Whether `body` was truncated at 64 KiB. */
+    /** Whether the original body exceeded 64 KiB, independent of redaction expansion. */
     readonly bodyTruncated?: boolean;
+    /** Advisory delay from retry-after-ms or Retry-After. Does not cause automatic retries. */
+    readonly retryAfterMs?: number;
 
     constructor(kind: DecisionsErrorKind, message: string, details: DecisionsErrorDetails = {}) {
         super(message, details.cause === undefined ? undefined : { cause: details.cause });
@@ -430,6 +450,7 @@ export class DecisionsError extends Error {
         this.requestId = details.requestId;
         this.body = details.body;
         this.bodyTruncated = details.bodyTruncated;
+        this.retryAfterMs = details.retryAfterMs;
     }
 }
 
@@ -459,8 +480,10 @@ export const MAX_ERROR_BODY_BYTES = 64 * 1024;
 export const MAX_RESPONSE_BYTES = 8 * 1024 * 1024;
 const MIN_SECRET_LENGTH = 8;
 const HEADER_NAME = /^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$/;
-const INVALID_HEADER_VALUE = /[\r\n\0]/;
+const INVALID_HEADER_VALUE = /[\x00-\x08\x0a-\x1f\x7f]/;
 const HTTP_WHITESPACE = /^[ \t]+|[ \t]+$/g;
+const DEFAULT_TIMEOUT_MS = 600_000;
+const MAX_TIMER_MS = 2_147_483_647;
 
 /** @internal */
 export interface DecisionsAttemptPlan {
@@ -477,21 +500,45 @@ function invalidEndpoint(message: string): DecisionsError {
 
 /** @internal Builds the Decisions URL from the endpoint's base URL. */
 export function buildDecisionsUrl(endpoint: Pick<ProviderEndpoint, "type" | "baseUrl">): string {
+    const baseUrl = endpoint.baseUrl;
+    if (
+        typeof baseUrl !== "string" ||
+        !/^https?:\/\//i.test(baseUrl) ||
+        /[^\x21-\x7e]|\\/.test(baseUrl) ||
+        /%(?![0-9a-f]{2})/i.test(baseUrl)
+    ) {
+        throw invalidEndpoint("The provider endpoint must be an encoded absolute HTTP(S) URL.");
+    }
+    const authority = baseUrl.slice(baseUrl.indexOf("://") + 3).split(/[/?#]/, 1)[0]!;
+    if (!authority || authority.includes("@")) {
+        throw invalidEndpoint("The provider endpoint URL must have a host and no userinfo.");
+    }
+    const hostPort = authority.startsWith("[")
+        ? /^(\[[^\]]+\])(?::([0-9]+))?$/.exec(authority)
+        : /^([^:]+)(?::([0-9]+))?$/.exec(authority);
+    if (!hostPort || (hostPort[2] !== undefined && Number(hostPort[2]) > 65535)) {
+        throw invalidEndpoint("The provider endpoint URL has an invalid host or port.");
+    }
     let url: URL;
     try {
-        url = new URL(endpoint.baseUrl);
+        url = new URL(baseUrl);
     } catch {
         throw invalidEndpoint("The provider endpoint base URL is not a valid absolute URL.");
     }
     if (url.protocol !== "http:" && url.protocol !== "https:") {
         throw invalidEndpoint("The provider endpoint base URL must use http or https.");
     }
-    // WHATWG URL drops empty userinfo ("https://@host", "https://:@host"), so check the raw authority too.
-    const afterScheme = endpoint.baseUrl.trim().replace(/^[a-z][a-z0-9+.-]*:[/\\]*/i, "");
-    const authority = afterScheme.split(/[/\\?#]/, 1)[0] ?? "";
-    if (url.username !== "" || url.password !== "" || authority.includes("@")) {
+    if (url.username !== "" || url.password !== "") {
         throw invalidEndpoint("The provider endpoint base URL must not contain credentials.");
     }
+    const hostname = url.hostname;
+    const validHost = hostname.startsWith("[")
+        ? isIP(hostname.slice(1, -1)) === 6
+        : hostname.length <= 254 &&
+          hostname.replace(/\.$/, "").split(".").every((label) =>
+              /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/i.test(label)
+          );
+    if (!validHost) throw invalidEndpoint("The provider endpoint URL has an invalid host.");
     const basePath = url.pathname.replace(/\/+$/, "");
     const suffix =
         endpoint.type === "azure" && !basePath.toLowerCase().endsWith("/openai/v1")
@@ -501,14 +548,37 @@ export function buildDecisionsUrl(endpoint: Pick<ProviderEndpoint, "type" | "bas
 }
 
 function checkHeader(name: string, value: string): string {
-    if (!HEADER_NAME.test(name) || INVALID_HEADER_VALUE.test(value)) {
+    if (
+        typeof name !== "string" ||
+        typeof value !== "string" ||
+        !HEADER_NAME.test(name) ||
+        INVALID_HEADER_VALUE.test(value) ||
+        hasUnpairedSurrogate(value)
+    ) {
         throw invalidEndpoint("The provider endpoint returned an invalid HTTP header.");
     }
     return value.replace(HTTP_WHITESPACE, "");
 }
 
+function hasUnpairedSurrogate(value: string): boolean {
+    for (let i = 0; i < value.length; i++) {
+        const code = value.charCodeAt(i);
+        if (code >= 0xd800 && code <= 0xdbff) {
+            const next = value.charCodeAt(++i);
+            if (!(next >= 0xdc00 && next <= 0xdfff)) return true;
+        } else if (code >= 0xdc00 && code <= 0xdfff) {
+            return true;
+        }
+    }
+    return false;
+}
+
 /** @internal Merges endpoint headers and credentials into the outbound header set. */
 export function buildDecisionsHeaders(endpoint: ProviderEndpoint): Record<string, string> {
+    if (endpoint.headers != null && !isObject(endpoint.headers)) {
+        throw invalidEndpoint("The provider endpoint returned invalid HTTP headers.");
+    }
+    if (endpoint.apiKey != null) checkHeader("api-key", endpoint.apiKey);
     const merged = new Map<string, string>();
     for (const [name, rawValue] of Object.entries(endpoint.headers ?? {})) {
         if (rawValue === undefined || rawValue === null) continue;
@@ -558,23 +628,24 @@ export function planDecisionsAttempt(
     endpoint: ProviderEndpoint,
     model: string
 ): DecisionsAttemptPlan {
+    if (!isObject(endpoint)) throw invalidEndpoint("The provider endpoint is invalid.");
     if (endpoint.type !== "openai" && endpoint.type !== "azure") {
         throw new DecisionsError(
             "unsupportedProvider",
-            `The session's provider type '${String(endpoint.type)}' does not support the Decisions API.`
+            "The session's provider type does not support the Decisions API."
         );
     }
     if (endpoint.transport !== undefined && endpoint.transport !== "http") {
         throw new DecisionsError(
             "unsupportedTransport",
-            `The session's provider transport '${String(endpoint.transport)}' is not supported by the Decisions API.`
+            "The session's provider transport is not supported by the Decisions API."
         );
     }
     const tokenModel = endpoint.sessionToken?.model;
     if (tokenModel !== undefined && tokenModel !== null && tokenModel !== model) {
         throw new DecisionsError(
             "modelMismatch",
-            `The provider session token is bound to model '${tokenModel}', but the request uses '${model}'. Set endpointModelId or request.model consistently.`
+            "The provider session token is bound to a different model. Set endpointModelId or request.model consistently."
         );
     }
     const url = buildDecisionsUrl(endpoint);
@@ -588,36 +659,57 @@ export function planDecisionsAttempt(
             ? null
             : [sessionTokenHeader, headers[sessionTokenHeader] ?? null],
     ]);
-    return { url, headers, fingerprint, secrets: collectSecrets(endpoint, url) };
+    return { url, headers, fingerprint, secrets: collectSecrets(endpoint, url, headers) };
 }
 
 /** Length in Unicode scalar values, so the minimum is identical across SDK languages. */
 const scalarLength = (value: string): number => [...value].length;
 
 /**
- * @internal Credentials that must never surface in errors: the apiKey, every endpoint header value,
- * the session token, a bearer token without its scheme, and URL query values. Each is trimmed of
- * SP/HTAB, kept only if at least {@link MIN_SECRET_LENGTH} scalar values long, then expanded into its
- * wire encodings. Sorted longest first.
+ * @internal Protect every nonempty SP/HTAB-trimmed actual credential, regardless of length.
+ * Other header/query values use the eight-Unicode-scalar heuristic. Qualifying decoded query
+ * values also retain their raw percent/form representation, including lossy UTF-8 decoding.
+ * Supported literal, JSON, escaped-slash, percent and form encodings are protected, not general PII.
  */
 export function collectSecrets(
     endpoint: Pick<ProviderEndpoint, "apiKey" | "sessionToken" | "headers">,
-    url?: string
+    url?: string,
+    effectiveHeaders?: Record<string, string>
 ): string[] {
     const raw = new Set<string>();
-    const add = (value: string | undefined | null) => {
-        if (typeof value !== "string") return;
+    const add = (value: string | undefined | null, credential = false) => {
+        if (typeof value !== "string") return false;
         const trimmed = value.replace(HTTP_WHITESPACE, "");
-        if (scalarLength(trimmed) >= MIN_SECRET_LENGTH) raw.add(trimmed);
+        if (!trimmed || (!credential && scalarLength(trimmed) < MIN_SECRET_LENGTH)) return false;
+        raw.add(trimmed);
+        return true;
     };
-    add(endpoint.apiKey);
-    add(endpoint.sessionToken?.token);
-    for (const value of Object.values(endpoint.headers ?? {})) {
-        add(value);
-        if (typeof value === "string") add(value.replace(/^[ \t]*bearer[ \t]+/i, ""));
+    add(endpoint.apiKey, true);
+    add(endpoint.sessionToken?.token, true);
+    const tokenHeader = endpoint.sessionToken?.header.toLowerCase();
+    if (tokenHeader === "authorization") {
+        add(endpoint.sessionToken?.token.replace(/^[ \t]*bearer[ \t]+/i, ""), true);
+    }
+    for (const [name, value] of [
+        ...Object.entries(endpoint.headers ?? {}),
+        ...Object.entries(effectiveHeaders ?? {}),
+    ]) {
+        const lower = name.toLowerCase();
+        const credential = lower === "authorization" || lower === "api-key" || lower === tokenHeader;
+        add(value, credential);
+        if (typeof value === "string") {
+            add(value.replace(/^[ \t]*bearer[ \t]+/i, ""), credential);
+        }
     }
     if (url) {
-        for (const value of new URL(url).searchParams.values()) add(value);
+        for (const parameter of new URL(url).search.slice(1).split("&")) {
+            const equals = parameter.indexOf("=");
+            if (equals < 0) continue;
+            const decoded = new URLSearchParams(parameter).values().next().value;
+            // Encoded length must not promote a short logical value. Preserve the original
+            // spelling once it qualifies: re-encoding U+FFFD cannot recover a raw %FF echo.
+            if (add(decoded)) add(parameter.slice(equals + 1));
+        }
     }
     const variants = new Set<string>();
     for (const secret of raw) {
@@ -650,38 +742,77 @@ function maxSecretBytes(secrets: readonly string[]): number {
     return max;
 }
 
-const escapeRegExp = (value: string): string => value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+const foldHex = (value: string): string => value.replace(/[A-F]/g, (c) => c.toLowerCase());
 
-/**
- * Regex source for one secret variant. Hex digits inside `\uXXXX` and `%XX` escapes match
- * case-insensitively because both casings are valid encodings of the same character.
- */
-function variantPattern(variant: string): string {
-    let out = "";
-    let i = 0;
-    const hex = (c: string) => (/[a-f]/i.test(c) ? `[${c.toLowerCase()}${c.toUpperCase()}]` : c);
-    while (i < variant.length) {
-        if (variant.startsWith("\\u", i) && /^[0-9a-f]{4}$/i.test(variant.slice(i + 2, i + 6))) {
-            out += "\\\\u" + [...variant.slice(i + 2, i + 6)].map(hex).join("");
-            i += 6;
-        } else if (variant[i] === "%" && /^[0-9a-f]{2}$/i.test(variant.slice(i + 1, i + 3))) {
-            out += "%" + [...variant.slice(i + 1, i + 3)].map(hex).join("");
-            i += 3;
-        } else {
-            out += escapeRegExp(variant[i]!);
-            i += 1;
+/** Literal spans outside case-insensitive escape digits, preserving original character offsets. */
+function literalSpans(variant: string): { offset: number; text: string }[] {
+    const spans: { offset: number; text: string }[] = [];
+    let start = 0;
+    for (const match of variant.matchAll(/\\u[0-9a-fA-F]{4}|%[0-9a-fA-F]{2}/g)) {
+        for (let i = match.index!; i < match.index! + match[0].length; i++) {
+            if (/[a-fA-F]/.test(variant[i]!)) {
+                if (i > start) spans.push({ offset: start, text: variant.slice(start, i) });
+                start = i + 1;
+            }
         }
     }
-    return out;
+    if (start < variant.length) spans.push({ offset: start, text: variant.slice(start) });
+    return spans;
 }
 
-/** @internal Replaces every occurrence of any secret variant with `[REDACTED]`, longest first. */
-export function redactSecrets(text: string, secrets: readonly string[]): string {
-    let result = text;
+/** Match original text, including self-overlap, before doing any replacement. */
+function secretIntervals(text: string, secrets: readonly string[]): [number, number][] {
+    const matches: [number, number][] = [];
+    let folded: string | undefined;
     for (const secret of secrets) {
-        result = result.replace(new RegExp(variantPattern(secret), "g"), "[REDACTED]");
+        if (!secret) continue;
+        const spans = literalSpans(secret);
+        const exact = spans.length === 1 && spans[0]!.text === secret;
+        // Avoid constructing a provider-sized regex. Fold ASCII hex for candidate search only,
+        // then verify every ordinary character against the unmodified original text.
+        const haystack = exact ? text : (folded ??= foldHex(text));
+        const needle = exact ? secret : foldHex(secret);
+        let from = 0;
+        for (;;) {
+            const index = haystack.indexOf(needle, from);
+            if (index < 0) break;
+            if (exact || spans.every((span) => text.startsWith(span.text, index + span.offset))) {
+                matches.push([index, index + secret.length]);
+            }
+            from = index + 1;
+        }
     }
-    return result;
+    matches.sort((a, b) => a[0] - b[0] || b[1] - a[1]);
+    const unions: [number, number][] = [];
+    for (const match of matches) {
+        const previous = unions[unions.length - 1];
+        if (previous && match[0] < previous[1]) {
+            previous[1] = Math.max(previous[1], match[1]);
+        } else {
+            unions.push([...match]);
+        }
+    }
+    return unions;
+}
+
+/**
+ * @internal Unions all overlapping original matches. `end` bounds ORIGINAL retained text;
+ * matches crossing it are replaced whole, and lookahead never becomes retained content.
+ */
+export function redactSecrets(
+    text: string,
+    secrets: readonly string[],
+    end = text.length
+): string {
+    const parts: string[] = [];
+    let start = 0;
+    for (const [from, to] of secretIntervals(text, secrets)) {
+        if (from >= end) break;
+        parts.push(text.slice(start, from), "[REDACTED]");
+        start = to;
+    }
+    if (start < end) parts.push(text.slice(start, end));
+    return parts.join("");
 }
 
 // ============================================================================
@@ -694,47 +825,72 @@ function setIfPresent(target: JsonObject, key: string, value: unknown): void {
     if (value !== undefined && value !== null) target[key] = value;
 }
 
-function serializePart(part: {
-    type: string;
-    [key: string]: unknown;
-}): JsonObject {
+function requiredText(value: unknown): string {
+    if (typeof value !== "string") throw new TypeError("Expected a Decisions text value.");
+    return value;
+}
+
+function serializePart(
+    part: unknown,
+    allowed: readonly string[],
+    cacheBreakpoints: boolean
+): JsonObject {
+    if (!isObject(part) || typeof part.type !== "string" || !allowed.includes(part.type)) {
+        throw new TypeError("Unsupported Decisions content part for this context.");
+    }
+    const breakpoint = cacheBreakpoints ? part.promptCacheBreakpoint : undefined;
+    if (breakpoint != null && (!isObject(breakpoint) || breakpoint.mode !== "explicit")) {
+        throw new TypeError("Invalid Decisions cache breakpoint.");
+    }
     switch (part.type) {
         case "input_text": {
-            const p = part as unknown as DecisionsInputText;
-            const out: JsonObject = { type: "input_text", text: p.text };
-            setIfPresent(out, "prompt_cache_breakpoint", p.promptCacheBreakpoint);
+            const out: JsonObject = { type: "input_text", text: requiredText(part.text) };
+            setIfPresent(out, "prompt_cache_breakpoint", breakpoint);
             return out;
         }
         case "input_image": {
-            const p = part as unknown as DecisionsInputImage;
-            const out: JsonObject = { type: "input_image", image_url: p.imageUrl };
-            setIfPresent(out, "detail", p.detail);
-            setIfPresent(out, "prompt_cache_breakpoint", p.promptCacheBreakpoint);
+            if (part.detail != null && (
+                typeof part.detail !== "string" || !["low", "high", "auto", "original"].includes(part.detail)
+            )) {
+                throw new TypeError("Invalid Decisions image detail.");
+            }
+            const out: JsonObject = { type: "input_image", image_url: requiredText(part.imageUrl) };
+            setIfPresent(out, "detail", part.detail);
+            setIfPresent(out, "prompt_cache_breakpoint", breakpoint);
             return out;
         }
-        case "input_json":
-            return { type: "input_json", data: (part as unknown as DecisionsInputJson).data };
+        case "input_json": {
+            if (!isObject(part.data) && !(Array.isArray(part.data) && part.data.every(isObject))) {
+                throw new TypeError("Expected an object or object array for Decisions JSON content.");
+            }
+            return { type: "input_json", data: part.data };
+        }
         case "output_text":
-            return { type: "output_text", text: (part as unknown as DecisionsOutputText).text };
+            return { type: "output_text", text: requiredText(part.text) };
         case "refusal":
-            return {
-                type: "refusal",
-                refusal: (part as unknown as DecisionsRefusalContent).refusal,
-            };
+            return { type: "refusal", refusal: requiredText(part.refusal) };
         default:
-            throw new TypeError(`Unsupported Decisions content part type '${part.type}'.`);
+            throw new TypeError("Unsupported Decisions content part.");
     }
 }
 
-function serializeContent(content: string | { type: string }[]): unknown {
-    return typeof content === "string"
-        ? content
-        : content.map((part) => serializePart(part as { type: string }));
+function serializeContent(
+    content: unknown,
+    allowed: readonly string[],
+    cacheBreakpoints = true
+): unknown {
+    if (typeof content === "string") return content;
+    if (!Array.isArray(content)) throw new TypeError("Expected Decisions content text or parts.");
+    return Array.from(content, (part) => serializePart(part, allowed, cacheBreakpoints));
 }
 
 function serializeInputItem(item: DecisionsInputItem): JsonObject {
-    if ("raw" in item) return item.raw;
-    if (!("type" in item) || item.type === undefined || item.type === "message") {
+    if (!isObject(item)) throw new TypeError("Expected a Decisions input item.");
+    if ("raw" in item) {
+        if (!isObject(item.raw)) throw new TypeError("Expected a raw Decisions input object.");
+        return item.raw;
+    }
+    if (!("type" in item) || item.type == null || item.type === "message") {
         const message = item as
             | DecisionsUserMessage
             | DecisionsDeveloperMessage
@@ -742,7 +898,22 @@ function serializeInputItem(item: DecisionsInputItem): JsonObject {
         const out: JsonObject = {};
         if (message.type === "message") out.type = "message";
         out.role = message.role;
-        out.content = serializeContent(message.content as string | { type: string }[]);
+        let allowed: readonly string[];
+        switch (message.role) {
+            case "user":
+                allowed = ["input_text", "input_image", "input_json"];
+                break;
+            case "developer":
+            case "system":
+                allowed = ["input_text"];
+                break;
+            case "assistant":
+                allowed = ["output_text", "refusal"];
+                break;
+            default:
+                throw new TypeError("Unsupported Decisions message role.");
+        }
+        out.content = serializeContent(message.content, allowed);
         if (message.role === "assistant") setIfPresent(out, "phase", message.phase);
         return out;
     }
@@ -750,9 +921,9 @@ function serializeInputItem(item: DecisionsInputItem): JsonObject {
         case "function_call": {
             const out: JsonObject = {
                 type: item.type,
-                call_id: item.callId,
-                name: item.name,
-                arguments: item.arguments,
+                call_id: requiredText(item.callId),
+                name: requiredText(item.name),
+                arguments: requiredText(item.arguments),
             };
             setIfPresent(out, "id", item.id);
             setIfPresent(out, "namespace", item.namespace);
@@ -762,9 +933,9 @@ function serializeInputItem(item: DecisionsInputItem): JsonObject {
         case "custom_tool_call": {
             const out: JsonObject = {
                 type: item.type,
-                call_id: item.callId,
-                name: item.name,
-                input: item.input,
+                call_id: requiredText(item.callId),
+                name: requiredText(item.name),
+                input: requiredText(item.input),
             };
             setIfPresent(out, "id", item.id);
             setIfPresent(out, "namespace", item.namespace);
@@ -775,20 +946,29 @@ function serializeInputItem(item: DecisionsInputItem): JsonObject {
         case "custom_tool_call_output": {
             const out: JsonObject = {
                 type: item.type,
-                call_id: item.callId,
-                output: serializeContent(item.output),
+                call_id: requiredText(item.callId),
+                output: serializeContent(item.output, ["input_text", "input_image"]),
             };
             setIfPresent(out, "id", item.id);
             setIfPresent(out, "status", item.status);
             return out;
         }
+        default:
+            throw new TypeError("Unsupported Decisions input item. Use an explicit raw wrapper.");
     }
 }
 
 function serializeQuestion(question: DecisionsQuestion): JsonObject {
+    if (!isObject(question) || !["predicate", "choice", "score"].includes(question.type)) {
+        throw new TypeError("Unsupported Decisions question.");
+    }
     const out: JsonObject = { type: question.type };
     setIfPresent(out, "name", question.name);
-    out.instructions = serializeContent(question.instructions as string | { type: string }[]);
+    out.instructions = serializeContent(
+        question.instructions,
+        ["input_text", "input_image", "input_json"],
+        false
+    );
     if (question.type === "choice") {
         out.choices = question.choices.map((choice) => {
             const c: JsonObject = { value: choice.value };
@@ -810,16 +990,23 @@ export function serializeDecisionsRequest(request: DecisionsRequest): JsonObject
     if (typeof request?.model !== "string" || request.model === "") {
         throw new TypeError("DecisionsRequest.model is required.");
     }
+    if (typeof request.input !== "string" && !Array.isArray(request.input)) {
+        throw new TypeError("Expected Decisions input text or an array of input items.");
+    }
+    if (!Array.isArray(request.questions)) throw new TypeError("Expected Decisions questions.");
     const out: JsonObject = {
         model: request.model,
         input:
             typeof request.input === "string"
                 ? request.input
-                : request.input.map((item) => serializeInputItem(item)),
-        questions: request.questions.map((q) => serializeQuestion(q)),
+                : Array.from(request.input, serializeInputItem),
+        questions: Array.from(request.questions, serializeQuestion),
     };
     setIfPresent(out, "prompt_cache_key", request.promptCacheKey);
     if (request.promptCacheOptions !== undefined && request.promptCacheOptions !== null) {
+        if (request.promptCacheOptions.ttl != null && request.promptCacheOptions.ttl !== "30m") {
+            throw new TypeError("Unsupported Decisions cache TTL; only 30m is supported.");
+        }
         const options: JsonObject = {};
         setIfPresent(options, "mode", request.promptCacheOptions.mode);
         setIfPresent(options, "ttl", request.promptCacheOptions.ttl);
@@ -843,9 +1030,42 @@ function num(obj: JsonObject, key: string): number {
     return value;
 }
 
-function optionalNum(obj: JsonObject | undefined, key: string): number {
-    if (!obj || obj[key] === undefined || obj[key] === null) return 0;
-    return num(obj, key);
+function integer(obj: JsonObject, key: string, source?: JsonObject): number {
+    const value = num(obj, key);
+    if (!Number.isSafeInteger(value) || (source && !exactInteger(source[key], value))) {
+        throw new InvalidResponse(`Expected signed safe integer '${key}'.`);
+    }
+    return value;
+}
+
+function exactInteger(token: unknown, value: number): boolean {
+    if (typeof token !== "string") return false;
+    const match = /^(-?)(\d+)(?:\.(\d+))?(?:[eE]([+-]?\d+))?$/.exec(token);
+    if (!match) return false;
+    const fraction = match[3] ?? "";
+    const digits = (match[2]! + fraction).replace(/^0+/, "");
+    if (!digits) return value === 0;
+    const significant = digits.replace(/0+$/, "");
+    const scale = Number(match[4] ?? 0) - fraction.length + digits.length - significant.length;
+    if (!Number.isFinite(scale) || scale < 0 || significant.length + scale > 16) return false;
+    return match[1] + significant + "0".repeat(scale) === String(value);
+}
+
+function optionalInteger(obj: JsonObject | undefined, key: string, source?: JsonObject): number {
+    if (!obj || !Object.hasOwn(obj, key)) return 0;
+    return integer(obj, key, source);
+}
+
+function details(obj: JsonObject, key: string): JsonObject | undefined {
+    if (!Object.hasOwn(obj, key)) return undefined;
+    if (!isObject(obj[key])) throw new InvalidResponse(`Expected object '${key}'.`);
+    return obj[key];
+}
+
+function probability(obj: JsonObject, key: string): number {
+    const value = num(obj, key);
+    if (value < 0 || value > 1) throw new InvalidResponse(`Expected probability '${key}'.`);
+    return value;
 }
 
 function str(obj: JsonObject, key: string): string {
@@ -877,21 +1097,21 @@ function answerName(obj: JsonObject): string | null {
     return value;
 }
 
-function parseAnswer(obj: JsonObject): DecisionsAnswer {
+function parseAnswer(obj: JsonObject, source?: JsonObject): DecisionsAnswer {
     const type = str(obj, "type");
     const name = answerName(obj);
     switch (type) {
         case "predicate":
-            return { type, name, probability: num(obj, "probability") };
+            return { type, name, probability: probability(obj, "probability") };
         case "choice":
             return {
                 type,
                 name,
                 choice: choiceValue(obj, "choice"),
-                confidence: num(obj, "confidence"),
+                confidence: probability(obj, "confidence"),
                 probabilities: arr(obj, "probabilities").map((p) => ({
                     value: choiceValue(p, "value"),
-                    probability: num(p, "probability"),
+                    probability: probability(p, "probability"),
                 })),
             };
         case "score":
@@ -899,13 +1119,11 @@ function parseAnswer(obj: JsonObject): DecisionsAnswer {
                 type,
                 name,
                 score: num(obj, "score"),
-                confidence: num(obj, "confidence"),
-                probabilities: arr(obj, "probabilities").map((p) => {
-                    const value = num(p, "value");
-                    if (!Number.isInteger(value)) {
-                        throw new InvalidResponse("Expected integer level 'value'.");
-                    }
-                    return { label: str(p, "label"), value, probability: num(p, "probability") };
+                confidence: probability(obj, "confidence"),
+                probabilities: arr(obj, "probabilities").map((p, i) => {
+                    const sources = source?.probabilities as JsonObject[] | undefined;
+                    const value = integer(p, "value", sources?.[i]);
+                    return { label: str(p, "label"), value, probability: probability(p, "probability") };
                 }),
             };
         case "refusal":
@@ -916,31 +1134,30 @@ function parseAnswer(obj: JsonObject): DecisionsAnswer {
 }
 
 /** @internal Parses a wire response into a typed result. Throws `DecisionsError` (invalidResponse). */
-export function parseDecisionsResult(json: unknown): DecisionsResult {
+export function parseDecisionsResult(json: unknown, numberSources?: unknown): DecisionsResult {
     try {
         if (!isObject(json)) throw new InvalidResponse("Expected a JSON object.");
         const usage = json.usage;
         if (!isObject(usage)) throw new InvalidResponse("Expected object 'usage'.");
-        const inputDetails = isObject(usage.input_tokens_details)
-            ? usage.input_tokens_details
-            : undefined;
-        const outputDetails = isObject(usage.output_tokens_details)
-            ? usage.output_tokens_details
-            : undefined;
+        const inputDetails = details(usage, "input_tokens_details");
+        const outputDetails = details(usage, "output_tokens_details");
+        const source = numberSources as JsonObject | undefined;
+        const usageSource = source?.usage as JsonObject | undefined;
+        const answerSources = source?.answers as JsonObject[] | undefined;
         return {
-            answers: arr(json, "answers").map(parseAnswer),
+            answers: arr(json, "answers").map((answer, i) => parseAnswer(answer, answerSources?.[i])),
             model: str(json, "model"),
             usage: {
-                inputTokens: optionalNum(usage, "input_tokens"),
+                inputTokens: optionalInteger(usage, "input_tokens", usageSource),
                 inputTokensDetails: {
-                    cachedTokens: optionalNum(inputDetails, "cached_tokens"),
-                    cacheWriteTokens: optionalNum(inputDetails, "cache_write_tokens"),
+                    cachedTokens: optionalInteger(inputDetails, "cached_tokens", usageSource?.input_tokens_details as JsonObject | undefined),
+                    cacheWriteTokens: optionalInteger(inputDetails, "cache_write_tokens", usageSource?.input_tokens_details as JsonObject | undefined),
                 },
-                outputTokens: optionalNum(usage, "output_tokens"),
+                outputTokens: optionalInteger(usage, "output_tokens", usageSource),
                 outputTokensDetails: {
-                    reasoningTokens: optionalNum(outputDetails, "reasoning_tokens"),
+                    reasoningTokens: optionalInteger(outputDetails, "reasoning_tokens", usageSource?.output_tokens_details as JsonObject | undefined),
                 },
-                totalTokens: optionalNum(usage, "total_tokens"),
+                totalTokens: optionalInteger(usage, "total_tokens", usageSource),
             },
         };
     } catch (error) {
@@ -954,9 +1171,188 @@ export function parseDecisionsResult(json: unknown): DecisionsResult {
     }
 }
 
+/** @internal Parses wire JSON without losing the original integer-token precision. */
+export function parseDecisionsResponse(text: string): DecisionsResult {
+    let json: unknown;
+    let numberSources: unknown;
+    try {
+        const raw = text.replace(/^\ufeff/, "");
+        json = JSON.parse(raw);
+        // Node 20 does not support JSON.parse reviver source context. Keep numeric lexemes in
+        // a parallel tree; strings are skipped intact and unknown payloads retain normal JSON.
+        numberSources = JSON.parse(raw.replace(
+            /"(?:[^"\\]|\\.)*"|-?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?/g,
+            (token) => token.startsWith('"') ? token : JSON.stringify(token)
+        ));
+    } catch {
+        throw new DecisionsError("invalidResponse", "The Decisions API returned a response that is not valid JSON.");
+    }
+    return parseDecisionsResult(json, numberSources);
+}
+
 // ============================================================================
 // Internal: HTTP
 // ============================================================================
+
+class CallScope {
+    private readonly controller = new AbortController();
+    readonly signal = this.controller.signal;
+    private readonly deadline: number | undefined;
+    private timer?: ReturnType<typeof setTimeout>;
+    private readonly callerAborted = () => this.controller.abort(this.caller?.reason);
+
+    constructor(timeoutMs: number | null, private readonly caller?: AbortSignal) {
+        caller?.throwIfAborted();
+        this.deadline = timeoutMs === null ? undefined : performance.now() + timeoutMs;
+        caller?.addEventListener("abort", this.callerAborted, { once: true });
+        this.schedule();
+    }
+
+    private schedule(): void {
+        if (this.deadline === undefined) return;
+        const remaining = this.deadline - performance.now();
+        if (remaining <= 0) {
+            this.expire();
+        } else {
+            this.timer = setTimeout(() => this.schedule(), Math.ceil(Math.min(remaining, MAX_TIMER_MS)));
+        }
+    }
+
+    private expire(): void {
+        if (!this.signal.aborted) {
+            this.controller.abort(new DecisionsError("timeout", "The Decisions call exceeded its SDK deadline."));
+        }
+    }
+
+    check(): void {
+        this.caller?.throwIfAborted();
+        if (this.deadline !== undefined && performance.now() >= this.deadline) this.expire();
+        this.signal.throwIfAborted();
+    }
+
+    private reason(): unknown {
+        try {
+            this.check();
+        } catch (error) {
+            return error;
+        }
+        return this.signal.reason;
+    }
+
+    wait<T>(start: () => Promise<T>, discard?: (value: T) => void): Promise<T> {
+        this.check();
+        return new Promise<T>((resolve, reject) => {
+            let settled = false;
+            const finish = (action: () => void) => {
+                if (settled) return;
+                settled = true;
+                this.signal.removeEventListener("abort", onAbort);
+                action();
+            };
+            const onAbort = () => finish(() => reject(this.reason()));
+            this.signal.addEventListener("abort", onAbort, { once: true });
+            let pending: Promise<T>;
+            try {
+                this.check();
+                pending = start();
+            } catch (error) {
+                finish(() => reject(error));
+                return;
+            }
+            // Both handlers stay attached to non-cancellable RPCs/transports after expiry.
+            // A late response is closed; a late rejection is observed, never rethrown.
+            void Promise.resolve(pending).then(
+                (value) => {
+                    if (settled) {
+                        discard?.(value);
+                        return;
+                    }
+                    finish(() => {
+                        try {
+                            this.check();
+                            resolve(value);
+                        } catch (error) {
+                            discard?.(value);
+                            reject(error);
+                        }
+                    });
+                },
+                (error: unknown) => finish(() => {
+                    reject(this.signal.aborted ? this.reason() : error);
+                })
+            );
+        });
+    }
+
+    dispose(): void {
+        if (this.timer !== undefined) clearTimeout(this.timer);
+        this.caller?.removeEventListener("abort", this.callerAborted);
+    }
+}
+
+function closeResponse(response: Response | undefined): void {
+    if (!response) return;
+    try {
+        void response.body?.cancel().catch(() => undefined);
+    } catch {
+        // Cleanup must not replace the call's result with a discarded transport exception.
+    }
+}
+
+/** Native HTTP has no independent header/body deadline and never follows redirects. */
+function fetchDecisionsHttp(url: string, init: RequestInit): Promise<Response> {
+    return new Promise((resolve, reject) => {
+        const target = new URL(url);
+        const request = (target.protocol === "https:" ? httpsRequest : httpRequest)(
+            target,
+            {
+                method: init.method,
+                headers: init.headers as Record<string, string>,
+                signal: init.signal ?? undefined,
+                agent: false,
+            },
+            (message) => {
+                try {
+                    const headers = new Headers();
+                    for (const [name, value] of Object.entries(message.headers)) {
+                        if (value !== undefined) headers.set(name, Array.isArray(value) ? value.join(", ") : value);
+                    }
+                    const status = message.statusCode ?? 500;
+                    const noBody = status === 204 || status === 205 || status === 304;
+                    if (noBody) message.destroy();
+                    let decoded: Readable = message;
+                    const encodings = (headers.get("content-encoding") ?? "")
+                        .split(",").map((value) => value.trim().toLowerCase()).filter(Boolean);
+                    if (!noBody && encodings.length && encodings.every((value) =>
+                        ["gzip", "x-gzip", "deflate", "br"].includes(value)
+                    )) {
+                        const decoders = encodings.reverse().map((value) =>
+                            value === "br" ? createBrotliDecompress()
+                                : value === "deflate" ? createInflate() : createGunzip()
+                        );
+                        decoded = decoders[decoders.length - 1]!;
+                        // Pipeline propagates read failure/cancellation to every decoder and socket.
+                        pipeline([message, ...decoders], () => undefined);
+                    }
+                    const body = noBody ? null : Readable.toWeb(decoded, {
+                        strategy: { highWaterMark: 0, size: (chunk: Uint8Array) => chunk.byteLength },
+                    }) as ReadableStream<Uint8Array>;
+                    resolve(new Response(body, { status, headers }));
+                } catch (error) {
+                    message.destroy();
+                    reject(error);
+                }
+            }
+        );
+        request.on("error", reject);
+        try {
+            request.end(init.body as string);
+        } catch (error) {
+            request.destroy();
+            reject(error);
+        }
+    });
+}
 
 class BodyReadError extends Error {}
 
@@ -966,7 +1362,8 @@ class BodyReadError extends Error {}
  */
 async function readLimited(
     response: Response,
-    limit: number
+    limit: number,
+    scope?: CallScope
 ): Promise<{ bytes: Uint8Array; exceeded: boolean }> {
     if (!response.body) return { bytes: new Uint8Array(0), exceeded: false };
     const reader = response.body.getReader();
@@ -975,21 +1372,26 @@ async function readLimited(
     let exceeded = false;
     try {
         for (;;) {
-            const { done, value } = await reader.read();
+            const { done, value } = await (scope ? scope.wait(() => reader.read()) : reader.read());
             if (done) break;
             const remaining = limit - total;
             if (value.byteLength > remaining) {
                 chunks.push(value.subarray(0, remaining));
                 total = limit;
                 exceeded = true;
-                await reader.cancel().catch(() => undefined);
                 break;
             }
             chunks.push(value);
             total += value.byteLength;
         }
     } catch (error) {
+        scope?.check();
         throw new BodyReadError("Failed to read the response body.", { cause: error });
+    } finally {
+        // cancel() settles pending reads immediately even if an injected cancel hook stalls.
+        // Observe its completion without letting that hook extend the SDK deadline.
+        void reader.cancel().catch(() => undefined);
+        reader.releaseLock();
     }
     const bytes = new Uint8Array(total);
     let offset = 0;
@@ -1000,8 +1402,26 @@ async function readLimited(
     return { bytes, exceeded };
 }
 
-const decodeUtf8 = (bytes: Uint8Array): string =>
-    new TextDecoder("utf-8", { fatal: false }).decode(bytes);
+const decodeUtf8 = (bytes: Uint8Array, partial = false): string =>
+    new TextDecoder("utf-8", { fatal: false, ignoreBOM: true }).decode(bytes, { stream: partial });
+
+function utf8Prefix(bytes: Uint8Array, limit: number): Uint8Array {
+    if (bytes.byteLength <= limit) return bytes;
+    let cut = limit;
+    while (cut > 0 && (bytes[cut]! & 0xc0) === 0x80) cut--;
+    return bytes.subarray(0, cut);
+}
+
+function capDiagnostic(text: string): string {
+    return decodeUtf8(utf8Prefix(new TextEncoder().encode(text), MAX_ERROR_BODY_BYTES));
+}
+
+function boundedDiagnostic(text: string, secrets: readonly string[]): string {
+    const bytes = new TextEncoder().encode(text);
+    const raw = decodeUtf8(utf8Prefix(bytes, MAX_ERROR_BODY_BYTES + maxSecretBytes(secrets)));
+    const retained = decodeUtf8(utf8Prefix(bytes, MAX_ERROR_BODY_BYTES));
+    return capDiagnostic(redactSecrets(raw, secrets, retained.length));
+}
 
 /**
  * Reads an error body capped at {@link MAX_ERROR_BODY_BYTES}. A lookahead window as long as the
@@ -1010,23 +1430,19 @@ const decodeUtf8 = (bytes: Uint8Array): string =>
  */
 async function readRedactedErrorBody(
     response: Response,
-    secrets: readonly string[]
+    secrets: readonly string[],
+    scope?: CallScope
 ): Promise<{ raw: string; body: string; truncated: boolean }> {
     const window = MAX_ERROR_BODY_BYTES + maxSecretBytes(secrets);
-    const { bytes, exceeded } = await readLimited(response, window);
-    const raw = decodeUtf8(bytes);
-    const redacted = redactSecrets(raw, secrets);
+    const { bytes, exceeded } = await readLimited(response, window, scope);
+    const raw = decodeUtf8(bytes, exceeded);
+    const retained = decodeUtf8(
+        utf8Prefix(bytes, MAX_ERROR_BODY_BYTES),
+        exceeded && bytes.byteLength <= MAX_ERROR_BODY_BYTES
+    );
+    const redacted = redactSecrets(raw, secrets, retained.length);
     const truncated = exceeded || bytes.byteLength > MAX_ERROR_BODY_BYTES;
-    const encoded = new TextEncoder().encode(redacted);
-    if (encoded.byteLength <= MAX_ERROR_BODY_BYTES) return { raw, body: redacted, truncated };
-    // Cut even when not truncated: replacing short secrets with "[REDACTED]" can grow the text.
-    let cut = MAX_ERROR_BODY_BYTES;
-    while (cut > 0 && (encoded[cut]! & 0xc0) === 0x80) cut--;
-    return {
-        raw,
-        body: decodeUtf8(encoded.subarray(0, cut)),
-        truncated,
-    };
+    return { raw, body: capDiagnostic(redacted), truncated };
 }
 
 function stringField(value: unknown): string | undefined {
@@ -1039,20 +1455,21 @@ function stringField(value: unknown): string | undefined {
 /** @internal Maps a non-2xx response to a `DecisionsError` (bounded, redacted). */
 export async function decisionsHttpError(
     response: Response,
-    secrets: readonly string[]
+    secrets: readonly string[],
+    scope?: CallScope
 ): Promise<DecisionsError> {
-    const { raw, body, truncated } = await readRedactedErrorBody(response, secrets);
+    const { raw, body, truncated } = await readRedactedErrorBody(response, secrets, scope);
     let errorType: string | undefined;
     let errorCode: string | undefined;
     let errorParam: string | undefined;
     let errorMessage: string | undefined;
     if (!truncated) {
         try {
-            const parsed: unknown = JSON.parse(raw);
+            const parsed: unknown = JSON.parse(raw.replace(/^\ufeff/, ""));
             if (isObject(parsed) && isObject(parsed.error)) {
                 const redact = (value: unknown) => {
                     const s = stringField(value);
-                    return s === undefined ? undefined : redactSecrets(s, secrets);
+                    return s === undefined ? undefined : boundedDiagnostic(s, secrets);
                 };
                 errorType = redact(parsed.error.type);
                 errorCode = redact(parsed.error.code);
@@ -1070,35 +1487,74 @@ export async function decisionsHttpError(
             : `HTTP ${status}`;
     return new DecisionsError(
         "http",
-        `Decisions request failed with ${statusText}${errorMessage ? `: ${errorMessage}` : "."}`,
+        capDiagnostic(`Decisions request failed with ${statusText}${errorMessage ? `: ${errorMessage}` : "."}`),
         {
             status,
             errorType,
             errorCode,
             errorParam,
-            requestId: response.headers.get("x-request-id") ?? undefined,
+            requestId: response.headers.has("x-request-id")
+                ? boundedDiagnostic(response.headers.get("x-request-id")!, secrets)
+                : undefined,
             body,
             bodyTruncated: truncated,
+            retryAfterMs: parseRetryAfterMs(response.headers),
         }
     );
 }
 
+function decimalDelay(value: string, scale: number): number | undefined {
+    if (!/^\d+(?:\.\d+)?$/.test(value)) return undefined;
+    const [whole, fraction = ""] = value.split(".");
+    const digits = (whole! + fraction.slice(0, scale).padEnd(scale, "0")).replace(/^0+/, "") || "0";
+    if (digits.length > 16) return undefined;
+    const delay = BigInt(digits) + (/[1-9]/.test(fraction.slice(scale)) ? 1n : 0n);
+    return delay <= 9007199254740991n ? Number(delay) : undefined;
+}
+
+/** @internal Deterministic advisory retry parser; never schedules a retry. */
+export function parseRetryAfterMs(headers: Pick<Headers, "get">, nowEpochMs = Date.now()): number | undefined {
+    const milliseconds = headers.get("retry-after-ms")?.replace(HTTP_WHITESPACE, "");
+    if (milliseconds !== undefined) {
+        const delay = decimalDelay(milliseconds, 0);
+        if (delay !== undefined) return delay;
+    }
+    const retryAfter = headers.get("retry-after")?.replace(HTTP_WHITESPACE, "");
+    if (retryAfter === undefined) return undefined;
+    const seconds = decimalDelay(retryAfter, 3);
+    if (seconds !== undefined) return seconds;
+    if (!/^(Mon|Tue|Wed|Thu|Fri|Sat|Sun), \d{2} (Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec) \d{4} \d{2}:\d{2}:\d{2} GMT$/.test(retryAfter)) {
+        return undefined;
+    }
+    const date = Date.parse(retryAfter);
+    if (!Number.isFinite(date) || new Date(date).toUTCString() !== retryAfter) return undefined;
+    const delay = Math.max(0, Math.ceil(date - nowEpochMs));
+    return Number.isSafeInteger(delay) ? delay : undefined;
+}
+
 /**
- * Builds a credential-free stand-in for a transport error: only the error name, a string `code`,
- * and the redacted message are retained, so request URLs and headers cannot leak through `cause`.
+ * Builds a bounded stand-in retaining only the redacted name/message/code, not raw exception
+ * objects, stacks, chains, URL/header attributes, or arbitrary structured details.
  */
 function sanitizeCause(error: unknown, secrets: readonly string[]): Error {
     const source = error instanceof BodyReadError ? error.cause : error;
-    const name = source instanceof Error ? source.name : "Error";
-    const message = redactSecrets(
-        source instanceof Error ? source.message : String(source),
-        secrets
-    );
-    const sanitized = new Error(message);
-    sanitized.name = name;
-    const code = isObject(source) ? source.code : undefined;
-    if (typeof code === "string") (sanitized as Error & { code?: string }).code = code;
-    return sanitized;
+    try {
+        const message = isObject(source) && typeof source.message === "string"
+            ? source.message : typeof source === "string" ? source : "Transport operation failed.";
+        const sanitized = new Error(boundedDiagnostic(message, secrets));
+        sanitized.name = boundedDiagnostic(
+            isObject(source) && typeof source.name === "string" ? source.name : "Error",
+            secrets
+        );
+        const code = isObject(source) ? source.code : undefined;
+        if (typeof code === "string") {
+            (sanitized as Error & { code?: string }).code = boundedDiagnostic(code, secrets);
+        }
+        delete sanitized.stack;
+        return sanitized;
+    } catch {
+        return new Error("Transport operation failed.");
+    }
 }
 
 function networkError(message: string, error: unknown, secrets: readonly string[]): DecisionsError {
@@ -1106,11 +1562,18 @@ function networkError(message: string, error: unknown, secrets: readonly string[
 }
 
 function endpointUnavailable(cause: unknown): DecisionsError {
-    const text = cause instanceof Error ? cause.message : String(cause);
-    const message = text.includes(GATE_ENV)
+    let gated = false;
+    try {
+        gated = cause instanceof Error && typeof cause.message === "string" && cause.message.includes(GATE_ENV);
+    } catch {
+        // Even reading an arbitrary RPC exception must not expose it.
+    }
+    const message = gated
         ? `session.decisions requires the runtime's provider endpoint API. Set ${GATE_ENV}=true in the runtime's environment (for in-process runtimes, in the host process environment before the runtime is loaded).`
         : "Could not resolve the session's provider endpoint for the Decisions API.";
-    return new DecisionsError("endpointUnavailable", message, { cause });
+    return new DecisionsError("endpointUnavailable", message, {
+        cause: new Error("Provider endpoint lookup failed."),
+    });
 }
 
 /** @internal Resolves the session's current provider endpoint. */
@@ -1129,103 +1592,106 @@ export class SessionDecisions implements SessionDecisionsApi {
         if (typeof request?.model !== "string" || request.model === "") {
             throw new TypeError("DecisionsRequest.model is required.");
         }
-        const { signal } = options;
-        const fetchImpl = options.fetch ?? fetch;
-
-        let plan = planDecisionsAttempt(await this.resolve(options), request.model);
-        const body = JSON.stringify(serializeDecisionsRequest(request));
-        let response = await this.send(fetchImpl, plan, body, signal);
-
-        if (response.status === 401 || response.status === 403) {
-            const original = await this.httpError(response, plan, signal);
-            const refreshedEndpoint = await this.resolve(options);
-            let refreshed: DecisionsAttemptPlan;
-            try {
-                refreshed = planDecisionsAttempt(refreshedEndpoint, request.model);
-            } catch {
-                throw original;
+        const timeoutMs = options.timeoutMs === undefined ? DEFAULT_TIMEOUT_MS : options.timeoutMs;
+        if (timeoutMs !== null && (typeof timeoutMs !== "number" || !Number.isFinite(timeoutMs) || timeoutMs <= 0)) {
+            throw new TypeError("Decisions timeoutMs must be null or a finite positive number.");
+        }
+        const scope = new CallScope(timeoutMs, options.signal);
+        const fetchImpl = options.fetch ?? fetchDecisionsHttp;
+        let response: Response | undefined;
+        try {
+            let plan = planDecisionsAttempt(await this.resolve(options, scope), request.model);
+            const body = JSON.stringify(serializeDecisionsRequest(request));
+            response = await this.send(fetchImpl, plan, body, scope);
+            if (response.status === 401 || response.status === 403) {
+                const original = await this.httpError(response, plan, scope);
+                closeResponse(response);
+                response = undefined;
+                const refreshedEndpoint = await this.resolve(options, scope);
+                let refreshed: DecisionsAttemptPlan;
+                try {
+                    refreshed = planDecisionsAttempt(refreshedEndpoint, request.model);
+                } catch {
+                    scope.check();
+                    throw original;
+                }
+                if (refreshed.fingerprint === plan.fingerprint) throw original;
+                refreshed.secrets = [...new Set([...plan.secrets, ...refreshed.secrets])];
+                plan = refreshed;
+                response = await this.send(fetchImpl, plan, body, scope);
             }
-            if (refreshed.fingerprint === plan.fingerprint) throw original;
-            plan = refreshed;
-            response = await this.send(fetchImpl, plan, body, signal);
-        }
 
-        if (response.status < 200 || response.status >= 300) {
-            throw await this.httpError(response, plan, signal);
-        }
-
-        let bytes: Uint8Array;
-        let exceeded: boolean;
-        try {
-            ({ bytes, exceeded } = await readLimited(response, MAX_RESPONSE_BYTES));
+            if (response.status < 200 || response.status >= 300) {
+                throw await this.httpError(response, plan, scope);
+            }
+            let bytes: Uint8Array;
+            let exceeded: boolean;
+            try {
+                ({ bytes, exceeded } = await readLimited(response, MAX_RESPONSE_BYTES, scope));
+            } catch (error) {
+                scope.check();
+                throw networkError("The Decisions response could not be read.", error, plan.secrets);
+            }
+            scope.check();
+            if (exceeded) {
+                throw new DecisionsError("invalidResponse", `The Decisions API response exceeded ${MAX_RESPONSE_BYTES} bytes.`);
+            }
+            const result = parseDecisionsResponse(decodeUtf8(bytes));
+            scope.check();
+            return result;
         } catch (error) {
-            if (signal?.aborted) throw signal.reason;
-            throw networkError("The Decisions response could not be read.", error, plan.secrets);
+            scope.check();
+            throw error;
+        } finally {
+            closeResponse(response);
+            scope.dispose();
         }
-        if (exceeded) {
-            throw new DecisionsError(
-                "invalidResponse",
-                `The Decisions API response exceeded ${MAX_RESPONSE_BYTES} bytes.`
-            );
-        }
-        let json: unknown;
-        try {
-            json = JSON.parse(decodeUtf8(bytes));
-        } catch {
-            throw new DecisionsError(
-                "invalidResponse",
-                "The Decisions API returned a response that is not valid JSON."
-            );
-        }
-        return parseDecisionsResult(json);
     }
 
     private async httpError(
         response: Response,
         plan: DecisionsAttemptPlan,
-        signal: AbortSignal | undefined
+        scope: CallScope
     ): Promise<DecisionsError> {
         try {
-            return await decisionsHttpError(response, plan.secrets);
+            const error = await decisionsHttpError(response, plan.secrets, scope);
+            scope.check();
+            return error;
         } catch (error) {
-            if (signal?.aborted) throw signal.reason;
+            scope.check();
             throw networkError("The Decisions error response could not be read.", error, plan.secrets);
         }
     }
 
-    private async resolve(options: DecisionsCallOptions): Promise<ProviderEndpoint> {
-        options.signal?.throwIfAborted();
-        let endpoint: ProviderEndpoint;
+    private async resolve(options: DecisionsCallOptions, scope: CallScope): Promise<ProviderEndpoint> {
         try {
-            endpoint = await this.resolveEndpoint(
+            return await scope.wait(() => this.resolveEndpoint(
                 options.endpointModelId === undefined
                     ? undefined
                     : { modelId: options.endpointModelId }
-            );
+            ));
         } catch (error) {
-            options.signal?.throwIfAborted();
+            scope.check();
             throw endpointUnavailable(error);
         }
-        options.signal?.throwIfAborted();
-        return endpoint;
     }
 
     private async send(
-        fetchImpl: typeof fetch,
+        fetchImpl: (url: string, init: RequestInit) => Promise<Response>,
         plan: DecisionsAttemptPlan,
         body: string,
-        signal: AbortSignal | undefined
+        scope: CallScope
     ): Promise<Response> {
         try {
-            return await fetchImpl(plan.url, {
+            return await scope.wait(() => fetchImpl(plan.url, {
                 method: "POST",
                 headers: plan.headers,
                 body,
                 redirect: "manual",
-                signal,
-            });
+                signal: scope.signal,
+            }), closeResponse);
         } catch (error) {
-            if (signal?.aborted) throw error;
+            scope.check();
             throw networkError("The Decisions request could not be sent.", error, plan.secrets);
         }
     }

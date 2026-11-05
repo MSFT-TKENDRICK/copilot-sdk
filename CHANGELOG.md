@@ -11,7 +11,9 @@ See [GitHub Releases](https://github.com/github/copilot-sdk/releases) for the fu
 
 All six SDKs in this fork add an experimental `session.decisions.create(...)` that calls the OpenAI Decisions API (`POST /decisions`) on the session's own OpenAI or Azure provider. It returns typed predicate, choice, and score answers; a score is a probability-weighted, potentially fractional level index. It is built on `session.provider.getEndpoint`, so the runtime must run with `COPILOT_ALLOW_GET_PROVIDER_ENDPOINT=true`. The built-in HTTP clients never follow redirects. The OpenAI reference currently documents `gpt-6-luna`; the SDK sends the requested model verbatim.
 
-**Preview status:** local tests pass in all six SDKs, including Python integration with a real CLI and a local test provider. Live providers remain unverified, and adversarial review found unresolved error-path credential-redaction and edge-case correctness defects. Do not treat errors as credential-free or this extension as production-ready. See [Decisions](./docs/features/decisions.md) for architecture, setup, OpenAI/Jev comparison, timeouts/retries, and known limitations.
+The hardening pass adds a default 600-second whole-call deadline, a distinct `timeout` error, advisory retry delays, expanded credential redaction, strict response-number handling, and 133 shared conformance vectors per SDK. Valid text/image/JSON question instructions remain supported; unreadable authentication bodies do not trigger credential refresh or replay.
+
+**Preview status:** Node.js, Python, and Java hardening checks pass locally, including Python integration with a real CLI and a local test provider. Complete six-SDK verification and SDK mutation evidence remain pending, and live providers are unverified. Do not treat arbitrary results/logs as credential-free or this extension as production-ready. See [Decisions](./docs/features/decisions.md) for architecture, setup, OpenAI/Jev comparison, deadlines/retries, and known limitations.
 
 ```ts
 const result = await session.decisions.create({

@@ -480,11 +480,11 @@ func TestDecisionsParsesFullResponseFixture(t *testing.T) {
 	if *score.Name != "severity" || score.Score != 1.37 {
 		t.Errorf("score = %+v", score)
 	}
-	var levels []int
+	var levels []int64
 	for _, p := range score.Probabilities {
 		levels = append(levels, p.Value)
 	}
-	if !reflect.DeepEqual(levels, []int{0, 1, 2}) || score.Probabilities[1].Label != "medium" {
+	if !reflect.DeepEqual(levels, []int64{0, 1, 2}) || score.Probabilities[1].Label != "medium" {
 		t.Errorf("score probabilities = %+v", score.Probabilities)
 	}
 	refusal := result.Answers[4].(copilot.DecisionsRefusalAnswer)
@@ -554,6 +554,7 @@ func TestDecisionsAnswerTypeSwitchIsExhaustive(t *testing.T) {
 func TestDecisionsVectorsURL(t *testing.T) {
 	for _, v := range loadDecisionsVectors(t).URL {
 		t.Run(v.Name, func(t *testing.T) {
+			recordDecisionsVector(t, "vectors.json", "url", v.Name)
 			got, err := copilot.BuildDecisionsURLForTest(&v.Endpoint)
 			if v.Error != "" {
 				de := asDecisionsError(t, err)
@@ -575,6 +576,7 @@ func TestDecisionsVectorsURL(t *testing.T) {
 func TestDecisionsVectorsHeaders(t *testing.T) {
 	for _, v := range loadDecisionsVectors(t).Headers {
 		t.Run(v.Name, func(t *testing.T) {
+			recordDecisionsVector(t, "vectors.json", "headers", v.Name)
 			_, headers, err := copilot.PlanDecisionsAttemptForTest(&v.Endpoint, "gpt-6-luna")
 			if v.Error != "" {
 				if de := asDecisionsError(t, err); string(de.Kind) != v.Error {
@@ -595,6 +597,7 @@ func TestDecisionsVectorsHeaders(t *testing.T) {
 func TestDecisionsVectorsPreflight(t *testing.T) {
 	for _, v := range loadDecisionsVectors(t).Preflight {
 		t.Run(v.Name, func(t *testing.T) {
+			recordDecisionsVector(t, "vectors.json", "preflight", v.Name)
 			_, _, err := copilot.PlanDecisionsAttemptForTest(&v.Endpoint, v.Model)
 			if v.Error != "" {
 				if de := asDecisionsError(t, err); string(de.Kind) != v.Error {
@@ -612,6 +615,7 @@ func TestDecisionsVectorsPreflight(t *testing.T) {
 func TestDecisionsVectorsRetry(t *testing.T) {
 	for _, v := range loadDecisionsVectors(t).Retry {
 		t.Run(v.Name, func(t *testing.T) {
+			recordDecisionsVector(t, "vectors.json", "retry", v.Name)
 			transport := newFakeDecisionsTransport(
 				jsonDecisionsResponse(401, `{"error":{"type":"auth","code":"expired"}}`),
 				jsonDecisionsResponse(200, okDecisionsBody(t)),
@@ -666,6 +670,7 @@ func TestDecisionsRetriesAtMostOnce(t *testing.T) {
 func TestDecisionsVectorsRedactionLength(t *testing.T) {
 	for _, v := range loadDecisionsVectors(t).RedactionLength {
 		t.Run(v.Name, func(t *testing.T) {
+			recordDecisionsVector(t, "vectors.json", "redactionLength", v.Name)
 			trimmed := strings.Trim(v.Value, " \t")
 			transport := newFakeDecisionsTransport(func(req *http.Request) (*http.Response, error) {
 				return &http.Response{StatusCode: 400, Header: http.Header{}, Body: io.NopCloser(strings.NewReader("echo:" + trimmed + ":end")), Request: req}, nil
@@ -689,6 +694,7 @@ func TestDecisionsVectorsRedactionLength(t *testing.T) {
 func TestDecisionsVectorsRedaction(t *testing.T) {
 	for _, v := range loadDecisionsVectors(t).Redaction {
 		t.Run(v.Name, func(t *testing.T) {
+			recordDecisionsVector(t, "vectors.json", "redaction", v.Name)
 			payload := v.Body
 			if v.BodyRepeat != nil {
 				payload = strings.ReplaceAll(payload, "{{repeat}}", strings.Repeat(v.BodyRepeat.Text, v.BodyRepeat.Count))
@@ -1138,8 +1144,8 @@ func TestDecisionsCreateSurfacesGateHintOnlyWhenMentioned(t *testing.T) {
 	if otherErr.Kind != copilot.DecisionsErrorKindEndpointUnavailable || strings.Contains(otherErr.Message, "COPILOT_ALLOW_GET_PROVIDER_ENDPOINT") {
 		t.Fatalf("other error = %v: %s", otherErr.Kind, otherErr.Message)
 	}
-	if !errors.Is(err, runtimeErr) {
-		t.Fatal("endpointUnavailable should unwrap to the resolution error")
+	if errors.Is(err, runtimeErr) || (otherErr.Cause != nil && strings.Contains(otherErr.Cause.Error(), runtimeErr.Error())) {
+		t.Fatal("endpointUnavailable must not retain the resolution error")
 	}
 }
 

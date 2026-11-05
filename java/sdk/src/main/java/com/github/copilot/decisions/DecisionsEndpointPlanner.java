@@ -8,6 +8,7 @@ import java.io.ByteArrayOutputStream;
 import java.net.URI;
 import java.net.URISyntaxException;
 import java.nio.charset.StandardCharsets;
+import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
@@ -62,20 +63,19 @@ final class DecisionsEndpointPlanner {
         }
         ProviderEndpointType type = endpoint.type();
         if (type != ProviderEndpointType.OPENAI && type != ProviderEndpointType.AZURE) {
-            throw new DecisionsException(DecisionsErrorKind.UNSUPPORTED_PROVIDER, "The session's provider type '"
-                    + (type == null ? "null" : type.getValue()) + "' does not support the Decisions API.");
+            throw new DecisionsException(DecisionsErrorKind.UNSUPPORTED_PROVIDER,
+                    "The session's provider type does not support the Decisions API.");
         }
         ProviderEndpointTransport transport = endpoint.transport();
         if (transport != null && transport != ProviderEndpointTransport.HTTP) {
-            throw new DecisionsException(DecisionsErrorKind.UNSUPPORTED_TRANSPORT, "The session's provider transport '"
-                    + transport.getValue() + "' is not supported by the Decisions API.");
+            throw new DecisionsException(DecisionsErrorKind.UNSUPPORTED_TRANSPORT,
+                    "The session's provider transport is not supported by the Decisions API.");
         }
         ProviderSessionToken token = endpoint.sessionToken();
         String tokenModel = token == null ? null : token.model();
         if (tokenModel != null && !tokenModel.equals(model)) {
             throw new DecisionsException(DecisionsErrorKind.MODEL_MISMATCH,
-                    "The provider session token is bound to model '" + tokenModel + "', but the request uses '" + model
-                            + "'. Set endpointModelId or request.model consistently.");
+                    "The provider session token is bound to a different model. Set endpointModelId or request.model consistently.");
         }
         String url = buildUrl(type, endpoint.baseUrl());
         Map<String, String> headers = buildHeaders(endpoint);
@@ -89,16 +89,23 @@ final class DecisionsEndpointPlanner {
         } else {
             fingerprint.addArray().add(tokenHeader).add(headers.get(tokenHeader));
         }
-        return new Plan(url, headers, fingerprint.toString(), collectSecrets(endpoint, url));
+        return new Plan(url, headers, fingerprint.toString(), collectSecrets(endpoint, url, headers));
     }
 
     static String buildUrl(ProviderEndpointType type, String baseUrl) {
-        if (baseUrl == null) {
+        if (baseUrl == null || !baseUrl.matches("(?i)^https?://.*")
+                || baseUrl.chars().anyMatch(c -> c <= 0x20 || c >= 0x7F || c == '\\')) {
             throw invalidEndpoint("The provider endpoint base URL is not a valid absolute URL.");
+        }
+        for (int i = 0; i < baseUrl.length(); i++) {
+            if (baseUrl.charAt(i) == '%' && (i + 2 >= baseUrl.length() || hex((byte) baseUrl.charAt(i + 1)) < 0
+                    || hex((byte) baseUrl.charAt(i + 2)) < 0)) {
+                throw invalidEndpoint("The provider endpoint base URL is not a valid absolute URL.");
+            }
         }
         URI uri;
         try {
-            uri = new URI(baseUrl);
+            uri = new URI(baseUrl).parseServerAuthority();
         } catch (URISyntaxException e) {
             throw invalidEndpoint("The provider endpoint base URL is not a valid absolute URL.");
         }
@@ -120,10 +127,13 @@ final class DecisionsEndpointPlanner {
         StringBuilder out = new StringBuilder();
         out.append(scheme).append("://").append(uri.getHost().toLowerCase(Locale.ROOT));
         int port = uri.getPort();
+        if (port > 65535 || authority.endsWith(":")) {
+            throw invalidEndpoint("The provider endpoint base URL has an invalid port.");
+        }
         if (port >= 0 && !(scheme.equals("http") && port == 80) && !(scheme.equals("https") && port == 443)) {
             out.append(':').append(port);
         }
-        String path = uri.getRawPath() == null ? "" : uri.getRawPath();
+        String path = normalizePath(uri.getRawPath() == null ? "" : uri.getRawPath());
         int end = path.length();
         while (end > 0 && path.charAt(end - 1) == '/') {
             end--;
@@ -142,10 +152,36 @@ final class DecisionsEndpointPlanner {
         return out.toString();
     }
 
+    private static String normalizePath(String path) {
+        List<String> segments = new ArrayList<>();
+        for (String segment : path.split("/", -1)) {
+            String dots = segment.replaceAll("(?i)%2e", ".");
+            if (dots.equals("..")) {
+                if (segments.size() > 1) {
+                    segments.remove(segments.size() - 1);
+                }
+            } else if (!dots.equals(".")) {
+                segments.add(segment);
+            }
+        }
+        return String.join("/", segments);
+    }
+
     private static String checkHeader(String name, String value) {
-        if (name == null || value == null || !HEADER_NAME.matcher(name).matches() || value.indexOf('\r') >= 0
-                || value.indexOf('\n') >= 0 || value.indexOf('\0') >= 0) {
+        if (name == null || value == null || !HEADER_NAME.matcher(name).matches()) {
             throw invalidEndpoint("The provider endpoint returned an invalid HTTP header.");
+        }
+        for (int i = 0; i < value.length(); i++) {
+            char c = value.charAt(i);
+            if (c < 0x20 && c != '\t' || c == 0x7F) {
+                throw invalidEndpoint("The provider endpoint returned an invalid HTTP header.");
+            }
+            if (Character.isHighSurrogate(c) && i + 1 < value.length()
+                    && Character.isLowSurrogate(value.charAt(i + 1))) {
+                i++;
+            } else if (Character.isSurrogate(c)) {
+                throw invalidEndpoint("The provider endpoint returned an invalid HTTP header.");
+            }
         }
         return DecisionsRedaction.trimOws(value);
     }
@@ -172,7 +208,7 @@ final class DecisionsEndpointPlanner {
         }
 
         String apiKeyHeader = null;
-        String apiKey = endpoint.apiKey();
+        String apiKey = endpoint.apiKey() == null ? null : checkHeader("api-key", endpoint.apiKey());
         if (apiKey != null && !apiKey.isEmpty() && !merged.containsKey("authorization")
                 && !merged.containsKey("api-key")) {
             if (endpoint.type() == ProviderEndpointType.AZURE) {
@@ -200,21 +236,17 @@ final class DecisionsEndpointPlanner {
         return merged;
     }
 
-    static List<String> collectSecrets(SessionProviderGetEndpointResult endpoint, String url) {
+    static List<String> collectSecrets(SessionProviderGetEndpointResult endpoint, String url,
+            Map<String, String> effectiveHeaders) {
         Set<String> raw = new LinkedHashSet<>();
-        DecisionsRedaction.addCandidate(raw, endpoint.apiKey());
+        DecisionsRedaction.addCandidate(raw, endpoint.apiKey(), true);
         if (endpoint.sessionToken() != null) {
-            DecisionsRedaction.addCandidate(raw, endpoint.sessionToken().token());
+            DecisionsRedaction.addCandidate(raw, endpoint.sessionToken().token(), true);
         }
         if (endpoint.headers() != null) {
-            for (String value : endpoint.headers().values()) {
-                if (value == null) {
-                    continue;
-                }
-                DecisionsRedaction.addCandidate(raw, value);
-                DecisionsRedaction.addCandidate(raw, BEARER_PREFIX.matcher(value).replaceFirst(""));
-            }
+            collectHeaderSecrets(raw, endpoint, endpoint.headers(), false);
         }
+        collectHeaderSecrets(raw, endpoint, effectiveHeaders, true);
         if (url != null) {
             int q = url.indexOf('?');
             if (q >= 0) {
@@ -226,7 +258,24 @@ final class DecisionsEndpointPlanner {
         return DecisionsRedaction.expand(raw);
     }
 
-    /** Values of {@code URLSearchParams} for a raw query string. */
+    private static void collectHeaderSecrets(Set<String> raw, SessionProviderGetEndpointResult endpoint,
+            Map<String, String> headers, boolean credentialsOnly) {
+        String tokenHeader = endpoint.sessionToken() == null ? null : endpoint.sessionToken().header();
+        headers.forEach((name, value) -> {
+            if (value != null) {
+                boolean credential = "authorization".equalsIgnoreCase(name) || "api-key".equalsIgnoreCase(name)
+                        || name != null && name.equalsIgnoreCase(tokenHeader);
+                if (credential || !credentialsOnly) {
+                    DecisionsRedaction.addCandidate(raw, value, credential);
+                    DecisionsRedaction.addCandidate(raw, BEARER_PREFIX.matcher(value).replaceFirst(""), credential);
+                }
+            }
+        });
+    }
+
+    /**
+     * Qualifying raw and decoded query values, including invalid UTF-8 encodings.
+     */
     static List<String> searchParamValues(String query) {
         List<String> values = new java.util.ArrayList<>();
         for (String pair : query.split("&", -1)) {
@@ -234,7 +283,13 @@ final class DecisionsEndpointPlanner {
                 continue;
             }
             int eq = pair.indexOf('=');
-            values.add(formDecode(eq < 0 ? "" : pair.substring(eq + 1)));
+            String value = eq < 0 ? "" : pair.substring(eq + 1);
+            String decoded = formDecode(value);
+            String trimmed = DecisionsRedaction.trimOws(decoded);
+            if (trimmed.codePointCount(0, trimmed.length()) >= DecisionsRedaction.MIN_SECRET_LENGTH) {
+                values.add(value);
+                values.add(decoded);
+            }
         }
         return values;
     }

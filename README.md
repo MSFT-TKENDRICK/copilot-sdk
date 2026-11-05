@@ -12,7 +12,7 @@
 Agents for every app.
 
 > [!WARNING]
-> **Fork preview: OpenAI Decisions.** The `feature/decisions-api` branch adds an experimental typed Decisions API in all six SDKs. Local tests pass, but live provider calls remain unverified and known error-path credential-redaction defects are not fixed. This extension is **not production-ready** and is not installed by the upstream package commands below. See [how it works, examples, and current limitations](./docs/features/decisions.md) or [PR #1](https://github.com/MSFT-TKENDRICK/copilot-sdk/pull/1).
+> **Fork preview: OpenAI Decisions.** The `feature/decisions-api` branch adds an experimental typed Decisions API in all six SDKs. Credential-redaction, whole-call deadline, and validation hardening are under verification; the complete six-SDK and live-provider gates remain pending. This extension is **not production-ready** and is not installed by the upstream package commands below. See [how it works, examples, and current limitations](./docs/features/decisions.md) or [PR #1](https://github.com/MSFT-TKENDRICK/copilot-sdk/pull/1).
 
 Embed Copilot's agentic workflows in your application with the GitHub Copilot SDK for Python, TypeScript, Go, .NET, Java, and Rust.
 

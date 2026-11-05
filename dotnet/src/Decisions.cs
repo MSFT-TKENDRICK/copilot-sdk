@@ -53,13 +53,22 @@ public sealed class DecisionsOptions
     public string? EndpointModelId { get; set; }
 
     /// <summary>
+    /// Total time allowed for endpoint resolution, HTTP attempts, response bodies, and credential refresh.
+    /// <see langword="null"/> uses 600 seconds; <see cref="System.Threading.Timeout.InfiniteTimeSpan"/>
+    /// disables the SDK deadline. Other values must be positive. Expiry raises
+    /// <see cref="DecisionsErrorKind.Timeout"/>; caller cancellation remains native.
+    /// </summary>
+    public TimeSpan? Timeout { get; set; }
+
+    /// <summary>
     /// Custom HTTP handler (proxying, testing). The handler is not disposed by the SDK. Injected handlers are
-    /// trusted to apply their own redirect policy: an <see cref="HttpClientHandler"/> (or, on .NET,
+    /// trusted to apply their own TLS and redirect policy: an <see cref="HttpClientHandler"/> (or, on .NET,
     /// <c>SocketsHttpHandler</c>) found at the end of the handler chain must have
     /// <c>AllowAutoRedirect = false</c>, otherwise <see cref="ISessionDecisionsApi.CreateAsync"/> throws
     /// <see cref="ArgumentException"/>. If any other handler follows a redirect, the response is rejected with
     /// <see cref="DecisionsErrorKind.InvalidResponse"/>, but the redirected request has already been sent.
     /// When <see langword="null"/>, the SDK uses a shared handler that never follows redirects.
+    /// Handlers must honor cancellation; their independent timeouts surface as sanitized network failures.
     /// </summary>
     public HttpMessageHandler? Handler { get; set; }
 }
@@ -133,7 +142,7 @@ public sealed class DecisionsInputText : DecisionsContentPart
     [JsonPropertyName("text")]
     public string Text { get; set; } = string.Empty;
 
-    /// <summary>Optional explicit prompt-cache breakpoint. Not allowed in question instructions.</summary>
+    /// <summary>Optional explicit prompt-cache breakpoint for input; omitted from question instructions.</summary>
     [JsonPropertyName("prompt_cache_breakpoint")]
     public DecisionsCacheBreakpoint? PromptCacheBreakpoint { get; set; }
 }
@@ -153,7 +162,7 @@ public sealed class DecisionsInputImage : DecisionsContentPart
     [JsonPropertyName("detail")]
     public string? Detail { get; set; }
 
-    /// <summary>Optional explicit prompt-cache breakpoint. Not allowed in question instructions.</summary>
+    /// <summary>Optional explicit prompt-cache breakpoint for input; omitted from question instructions.</summary>
     [JsonPropertyName("prompt_cache_breakpoint")]
     public DecisionsCacheBreakpoint? PromptCacheBreakpoint { get; set; }
 }
@@ -458,8 +467,9 @@ public abstract class DecisionsQuestion
     public string? Name { get; set; }
 
     /// <summary>
-    /// The instructions: text, or <see cref="DecisionsInputText"/>, <see cref="DecisionsInputImage"/>, and
-    /// <see cref="DecisionsInputJson"/> parts (without cache breakpoints).
+    /// The instructions: text, or <see cref="DecisionsInputText"/>, <see cref="DecisionsInputImage"/>,
+    /// and <see cref="DecisionsInputJson"/> parts. Input cache breakpoints are omitted;
+    /// assistant and refusal parts are rejected.
     /// </summary>
     [JsonPropertyName("instructions")]
     public DecisionsContent? Instructions { get; set; }
@@ -531,7 +541,7 @@ public sealed class DecisionsPromptCacheOptions
     [JsonPropertyName("mode")]
     public string? Mode { get; set; }
 
-    /// <summary>Optional TTL, such as <c>30m</c>.</summary>
+    /// <summary>Optional TTL. The documented value is <c>30m</c>.</summary>
     [JsonPropertyName("ttl")]
     public string? Ttl { get; set; }
 }
@@ -607,12 +617,12 @@ public sealed record DecisionsChoiceAnswer(
 
 /// <summary>Probability of one score level.</summary>
 /// <param name="Label">The level label.</param>
-/// <param name="Value">Integer index of the level.</param>
+/// <param name="Value">Signed 64-bit integer index of the level, including provider sentinel values.</param>
 /// <param name="Probability">Its probability.</param>
 [Experimental(Diagnostics.Experimental)]
 public sealed record DecisionsScoreProbability(
     [property: JsonPropertyName("label")] string Label,
-    [property: JsonPropertyName("value")] int Value,
+    [property: JsonPropertyName("value")] long Value,
     [property: JsonPropertyName("probability")] double Probability);
 
 /// <summary>Answer to a <see cref="DecisionsScoreQuestion"/>.</summary>
@@ -653,7 +663,7 @@ public sealed record DecisionsInputTokensDetails(
 public sealed record DecisionsOutputTokensDetails(
     [property: JsonPropertyName("reasoning_tokens")] long ReasoningTokens);
 
-/// <summary>Token usage. Missing counts are reported as 0.</summary>
+/// <summary>Token usage. Counts are signed 64-bit integers; missing counts are reported as 0.</summary>
 /// <param name="InputTokens">Input tokens.</param>
 /// <param name="InputTokensDetails">Input token details.</param>
 /// <param name="OutputTokens">Output tokens.</param>
@@ -703,11 +713,16 @@ public enum DecisionsErrorKind
     InvalidResponse,
     /// <summary>The request could not be sent or the response could not be read.</summary>
     Network,
+    /// <summary>The SDK-owned total-call deadline expired. Caller cancellation remains native.</summary>
+    Timeout,
 }
 
 /// <summary>
-/// Error raised by <see cref="ISessionDecisionsApi.CreateAsync"/>. Messages and <see cref="Body"/> never contain
-/// credentials. Cancellation is reported with <see cref="OperationCanceledException"/>, not this type.
+/// Error raised by <see cref="ISessionDecisionsApi.CreateAsync"/>. Retained provider diagnostics redact
+/// known endpoint credentials, including short credentials, and recognized literal/escaped encodings.
+/// Other header/query values use an eight-Unicode-scalar heuristic. This is not general PII removal
+/// or protection against arbitrary transformations. Caller cancellation is reported with
+/// <see cref="OperationCanceledException"/>, not this type.
 /// </summary>
 [Experimental(Diagnostics.Experimental)]
 public sealed class DecisionsException : Exception
@@ -736,20 +751,27 @@ public sealed class DecisionsException : Exception
     /// <summary>Value of the <c>x-request-id</c> response header.</summary>
     public string? RequestId { get; internal init; }
 
-    /// <summary>Response body (at most 64 KiB of UTF-8, credentials redacted).</summary>
+    /// <summary>
+    /// Advisory retry delay in milliseconds from <c>retry-after-ms</c> or <c>Retry-After</c>.
+    /// No retry is scheduled. Invalid or absent hints yield <see langword="null"/>.
+    /// </summary>
+    public long? RetryAfterMs { get; internal init; }
+
+    /// <summary>Redacted original response-body prefix, at most 64 KiB of UTF-8.</summary>
     public string? Body { get; internal init; }
 
     /// <summary>
-    /// Whether <see cref="Body"/> was truncated. Truncation is applied after redaction at 65,536 UTF-8 bytes,
-    /// backing off to a character boundary (a split trailing character is dropped), so the body never exceeds that size.
+    /// Whether the original body exceeded 65,536 UTF-8 bytes. Lookahead is used only to recognize secrets
+    /// crossing that boundary, not retained as additional content. A final UTF-8-safe output cap also
+    /// limits redaction expansion without changing this flag.
     /// </summary>
     public bool? BodyTruncated { get; internal init; }
 }
 
 /// <summary>
-/// Credential-free stand-in for a transport exception, used as <see cref="Exception.InnerException"/> of
-/// <see cref="DecisionsErrorKind.Network"/> errors. Only the original type name, the redacted message, and a
-/// string code are retained, so request URLs and headers cannot leak through the original exception.
+/// Sanitized stand-in for a transport exception, used as <see cref="Exception.InnerException"/> of
+/// <see cref="DecisionsErrorKind.Network"/> errors. Only bounded, redacted type name, message, and code
+/// strings are retained; arbitrary exception properties and chains are discarded.
 /// </summary>
 [Experimental(Diagnostics.Experimental)]
 public sealed class DecisionsTransportException : Exception
@@ -761,7 +783,7 @@ public sealed class DecisionsTransportException : Exception
         Code = code;
     }
 
-    /// <summary>Full name of the original exception type.</summary>
+    /// <summary>Bounded, redacted full name of the original exception type.</summary>
     public string SourceTypeName { get; }
 
     /// <summary>

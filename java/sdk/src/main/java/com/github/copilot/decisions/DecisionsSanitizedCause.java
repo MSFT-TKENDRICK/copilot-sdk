@@ -11,11 +11,12 @@ import java.util.List;
 import com.github.copilot.CopilotExperimental;
 
 /**
- * Credential-free stand-in for a transport failure, used as the cause of
- * {@link DecisionsErrorKind#NETWORK} errors. Only the original exception's
- * class name, a string {@code code} (when the original exposes a public
- * {@code String getCode()}), and its redacted message are retained; it has no
- * cause and no stack trace, so request URLs and headers cannot leak through it.
+ * Bounded, credential-redacted stand-in for a transport failure, used as the
+ * cause of {@link DecisionsErrorKind#NETWORK} errors. Only the original
+ * exception's class name, a string {@code code} (when the original exposes a
+ * public {@code String getCode()}), and its redacted message are retained; it
+ * has no cause and no stack trace. Arbitrary URL/header attributes are not
+ * retained.
  *
  * @since 1.0.0
  */
@@ -34,10 +35,16 @@ public final class DecisionsSanitizedCause extends Exception {
     }
 
     static DecisionsSanitizedCause of(Throwable error, List<String> secrets) {
-        String rawMessage = error == null ? "null" : error.getMessage();
-        String message = DecisionsRedaction.redact(rawMessage == null ? "" : rawMessage, secrets);
+        String rawMessage;
+        try {
+            rawMessage = error == null ? "" : error.getMessage();
+        } catch (RuntimeException e) {
+            rawMessage = "Transport failure details were unavailable.";
+        }
+        String message = DecisionsRedaction.sanitize(rawMessage == null ? "" : rawMessage, secrets);
         String name = error == null ? "java.lang.Throwable" : error.getClass().getName();
-        return new DecisionsSanitizedCause(name, message, readCode(error));
+        return new DecisionsSanitizedCause(DecisionsRedaction.sanitize(name, secrets), message,
+                DecisionsRedaction.sanitize(readCode(error), secrets));
     }
 
     private static String readCode(Throwable error) {
@@ -76,6 +83,6 @@ public final class DecisionsSanitizedCause extends Exception {
 
     @Override
     public String toString() {
-        return name + ": " + getMessage();
+        return DecisionsRedaction.capUtf8(name + ": " + getMessage(), SessionDecisions.MAX_ERROR_BODY_BYTES);
     }
 }

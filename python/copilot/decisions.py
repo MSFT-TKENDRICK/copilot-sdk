@@ -10,12 +10,18 @@ See ``docs/features/decisions.md``.
 from __future__ import annotations
 
 import asyncio
+import codecs
 import json
 import math
 import re
+import time
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
+from datetime import UTC, datetime
+from decimal import Decimal, InvalidOperation
+from email.utils import format_datetime, parsedate_to_datetime
 from enum import Enum
+from ipaddress import IPv4Address, IPv6Address
 from typing import Any, Literal, NotRequired, TypedDict, cast
 from urllib.parse import parse_qsl, quote, urlsplit
 
@@ -132,7 +138,7 @@ class DecisionsRefusalContent(TypedDict):
 class DecisionsUserMessage(TypedDict):
     """**Experimental.** A user message."""
 
-    type: NotRequired[Literal["message"]]
+    type: NotRequired[Literal["message"] | None]
     role: Literal["user"]
     content: str | list[DecisionsInputText | DecisionsInputImage | DecisionsInputJson]
 
@@ -140,7 +146,7 @@ class DecisionsUserMessage(TypedDict):
 class DecisionsDeveloperMessage(TypedDict):
     """**Experimental.** A developer or system message."""
 
-    type: NotRequired[Literal["message"]]
+    type: NotRequired[Literal["message"] | None]
     role: Literal["developer", "system"]
     content: str | list[DecisionsInputText]
 
@@ -148,7 +154,7 @@ class DecisionsDeveloperMessage(TypedDict):
 class DecisionsAssistantMessage(TypedDict):
     """**Experimental.** An assistant message."""
 
-    type: NotRequired[Literal["message"]]
+    type: NotRequired[Literal["message"] | None]
     role: Literal["assistant"]
     content: str | list[DecisionsOutputText | DecisionsRefusalContent]
     phase: NotRequired[Literal["commentary", "final_answer"] | None]
@@ -350,7 +356,7 @@ class DecisionsScoreProbability:
 
     label: str
     value: int
-    """Integer index of the level."""
+    """Signed int64 index of the level."""
     probability: float
 
 
@@ -447,6 +453,7 @@ DecisionsErrorKind = Literal[
     "http",
     "invalidResponse",
     "network",
+    "timeout",
 ]
 """**Experimental.** Category of a :class:`DecisionsError`."""
 
@@ -454,9 +461,10 @@ DecisionsErrorKind = Literal[
 class DecisionsError(Exception):
     """**Experimental.** Error raised by ``session.decisions.create``.
 
-    Messages and ``body`` never contain credentials. Cancellation is reported with
-    :class:`asyncio.CancelledError` (or :class:`TimeoutError` for ``timeout``), never
-    with this type.
+    Retained provider diagnostics redact known credential encodings, including short
+    actual credentials. This is not general PII removal or protection against arbitrary
+    transformations of credentials. Caller cancellation remains
+    :class:`asyncio.CancelledError`; the SDK-owned deadline uses ``kind="timeout"``.
 
     Attributes:
         kind: Category of the error.
@@ -465,8 +473,11 @@ class DecisionsError(Exception):
         error_code: OpenAI error ``code``, when the error body was parsable.
         error_param: OpenAI error ``param``, when the error body was parsable.
         request_id: Value of the ``x-request-id`` response header.
-        body: Response body (at most 64 KiB, credentials redacted).
-        body_truncated: Whether ``body`` was truncated at 64 KiB.
+        body: Redacted original response prefix, capped at 64 KiB of UTF-8.
+        body_truncated: Whether the original body exceeded 64 KiB, not whether
+            redaction expanded the output.
+        retry_after_ms: Optional advisory delay in milliseconds from HTTP retry headers.
+            The SDK does not automatically retry based on this value.
     """
 
     def __init__(
@@ -481,6 +492,7 @@ class DecisionsError(Exception):
         request_id: str | None = None,
         body: str | None = None,
         body_truncated: bool | None = None,
+        retry_after_ms: int | None = None,
     ) -> None:
         super().__init__(message)
         self.kind: DecisionsErrorKind = kind
@@ -492,14 +504,16 @@ class DecisionsError(Exception):
         self.request_id = request_id
         self.body = body
         self.body_truncated = body_truncated
+        self.retry_after_ms = retry_after_ms
 
 
 class DecisionsTransportErrorCause(Exception):
-    """**Experimental.** Credential-free stand-in for a transport error.
+    """**Experimental.** Sanitized stand-in for a transport error.
 
     Set as ``__cause__`` of ``network`` :class:`DecisionsError` instances. Only the
     original exception type name (``name``), a string ``code`` attribute, and the
-    redacted message are retained, so request URLs and headers cannot leak.
+    message are retained, all bounded and redacted. Raw exception objects, chains,
+    request URLs, headers, and other attributes are not retained.
     """
 
     def __init__(self, name: str, message: str, code: str | None = None) -> None:
@@ -518,10 +532,17 @@ MAX_ERROR_BODY_BYTES = 64 * 1024
 MAX_RESPONSE_BYTES = 8 * 1024 * 1024
 _MIN_SECRET_LENGTH = 8
 _HEADER_NAME = re.compile(r"[!#$%&'*+\-.^_`|~0-9A-Za-z]+")
-_INVALID_HEADER_VALUE = re.compile(r"[\r\n\0]")
+_INVALID_HEADER_VALUE = re.compile(r"[\x00-\x08\x0a-\x1f\x7f\ud800-\udfff]")
 _HTTP_WHITESPACE = " \t"
 _BEARER_PREFIX = re.compile(r"^[ \t]*bearer[ \t]+", re.IGNORECASE)
 _DEFAULT_PORTS = {"http": 80, "https": 443}
+_AUTHORITY_PREFIX = re.compile(r"https?://", re.IGNORECASE)
+_INVALID_URI_CHARACTER = re.compile(r'[\x00-\x20\x7f\\<>"{}|^`]')
+_INVALID_PERCENT = re.compile(r"%(?![0-9a-fA-F]{2})")
+_HOST_LABEL = re.compile(r"[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?")
+_INT64_MIN = -(2**63)
+_INT64_MAX = 2**63 - 1
+_MAX_SAFE_INTEGER = 2**53 - 1
 
 
 @dataclass(frozen=True)
@@ -541,37 +562,62 @@ def _enum_value(value: Any) -> Any:
     return value.value if isinstance(value, Enum) else value
 
 
+def _normalize_dot_path(path: str) -> str:
+    segments: list[str] = []
+    for segment in path.split("/"):
+        dots = re.sub("%2e", ".", segment, flags=re.IGNORECASE)
+        if dots == "..":
+            if len(segments) > 1:
+                segments.pop()
+        elif dots != ".":
+            segments.append(segment)
+    return "/".join(segments)
+
+
 def _build_decisions_url(endpoint: ProviderEndpoint) -> str:
     """Builds the Decisions URL from the endpoint's base URL."""
     base_url = endpoint.base_url
     invalid = "The provider endpoint base URL is not a valid absolute URL."
-    if not isinstance(base_url, str):
+    if (
+        not isinstance(base_url, str)
+        or not _AUTHORITY_PREFIX.match(base_url)
+        or not base_url.isascii()
+        or _INVALID_URI_CHARACTER.search(base_url)
+        or _INVALID_PERCENT.search(base_url)
+    ):
         raise _invalid_endpoint(invalid)
     try:
-        parts = urlsplit(
-            base_url.strip(
-                "\x00\x01\x02\x03\x04\x05\x06\x07\x08\t\n\x0b\x0c\r"
-                "\x0e\x0f\x10\x11\x12\x13\x14\x15\x16\x17\x18\x19\x1a"
-                "\x1b\x1c\x1d\x1e\x1f "
-            )
-        )
+        parts = urlsplit(base_url)
         hostname = parts.hostname
         port = parts.port
+        if not hostname or "@" in parts.netloc:
+            raise ValueError
+        if parts.netloc.startswith("["):
+            if not re.fullmatch(r"\[[^\]]+\](?::[0-9]+)?", parts.netloc):
+                raise ValueError
+            IPv6Address(hostname)
+        else:
+            if not re.fullmatch(r"[^:]+(?::[0-9]+)?", parts.netloc):
+                raise ValueError
+            domain = hostname.removesuffix(".")
+            if len(domain) > 253 or not all(
+                _HOST_LABEL.fullmatch(label) for label in domain.split(".")
+            ):
+                raise ValueError
+            if "." in domain and all(c in "0123456789." for c in domain):
+                IPv4Address(domain)
     except ValueError:
-        raise _invalid_endpoint(invalid) from None
+        failure = _invalid_endpoint(invalid)
+    else:
+        failure = None
+    if failure is not None:
+        raise failure
+    assert hostname is not None
     scheme = parts.scheme.lower()
-    if not scheme:
-        raise _invalid_endpoint(invalid)
-    if scheme not in _DEFAULT_PORTS:
-        raise _invalid_endpoint("The provider endpoint base URL must use http or https.")
-    if not hostname:
-        raise _invalid_endpoint(invalid)
-    if "@" in parts.netloc or parts.username is not None or parts.password is not None:
-        raise _invalid_endpoint("The provider endpoint base URL must not contain credentials.")
     host = f"[{hostname}]" if ":" in hostname else hostname
     if port is not None and port != _DEFAULT_PORTS[scheme]:
         host = f"{host}:{port}"
-    base_path = parts.path.rstrip("/")
+    base_path = _normalize_dot_path(parts.path).rstrip("/")
     is_azure = _enum_value(endpoint.type) == ProviderType.AZURE.value
     suffix = (
         "/openai/v1/decisions"
@@ -610,14 +656,15 @@ def _build_decisions_headers(endpoint: ProviderEndpoint) -> dict[str, str]:
             )
         merged[lower] = value
 
+    api_key = _check_header("api-key", endpoint.api_key) if endpoint.api_key is not None else None
     api_key_header: str | None = None
     if endpoint.api_key and "authorization" not in merged and "api-key" not in merged:
         if _enum_value(endpoint.type) == ProviderType.AZURE.value:
             api_key_header = "api-key"
-            merged[api_key_header] = _check_header(api_key_header, endpoint.api_key)
+            merged[api_key_header] = cast(str, api_key)
         else:
             api_key_header = "authorization"
-            merged[api_key_header] = "Bearer " + _check_header(api_key_header, endpoint.api_key)
+            merged[api_key_header] = "Bearer " + cast(str, api_key)
 
     token = endpoint.session_token
     if token is not None:
@@ -641,21 +688,20 @@ def _plan_attempt(endpoint: ProviderEndpoint, model: str) -> _AttemptPlan:
     if provider_type not in (ProviderType.OPENAI.value, ProviderType.AZURE.value):
         raise DecisionsError(
             "unsupportedProvider",
-            f"The session's provider type '{provider_type}' does not support the Decisions API.",
+            "The session's provider type does not support the Decisions API.",
         )
     transport = _enum_value(endpoint.transport)
     if transport is not None and transport != ProviderTransport.HTTP.value:
         raise DecisionsError(
             "unsupportedTransport",
-            f"The session's provider transport '{transport}' is not supported by the "
-            "Decisions API.",
+            "The session's provider transport is not supported by the Decisions API.",
         )
     token_model = endpoint.session_token.model if endpoint.session_token is not None else None
     if token_model is not None and token_model != model:
         raise DecisionsError(
             "modelMismatch",
-            f"The provider session token is bound to model '{token_model}', but the request "
-            f"uses '{model}'. Set endpoint_model_id or request model consistently.",
+            "The provider session token is bound to a different model. "
+            "Set endpoint_model_id or request model consistently.",
         )
     url = _build_decisions_url(endpoint)
     headers = _build_decisions_headers(endpoint)
@@ -668,37 +714,54 @@ def _plan_attempt(endpoint: ProviderEndpoint, model: str) -> _AttemptPlan:
         headers.get("api-key"),
         None if token_header is None else (token_header, headers.get(token_header)),
     )
-    return _AttemptPlan(url, headers, fingerprint, _collect_secrets(endpoint, url))
+    return _AttemptPlan(url, headers, fingerprint, _collect_secrets(endpoint, url, headers))
 
 
 def _utf16_length(value: str) -> int:
     return len(value.encode("utf-16-le", "surrogatepass")) // 2
 
 
-def _collect_secrets(endpoint: ProviderEndpoint, url: str | None = None) -> list[str]:
-    """Credentials that must never surface in errors, expanded into wire encodings.
+def _collect_secrets(
+    endpoint: ProviderEndpoint, url: str | None = None, headers: Mapping[str, str] | None = None
+) -> list[str]:
+    """Known credential candidates, expanded into supported wire encodings.
 
-    Sources: the apiKey, every endpoint header value (and the value without a leading
-    bearer scheme), the session token, and URL query values. Each is trimmed of SP/HTAB
-    and kept only if at least 8 Unicode scalar values long. Sorted longest first.
+    Every nonempty SP/HTAB-trimmed actual credential is protected regardless of length.
+    Other endpoint headers and query values use an eight-Unicode-scalar heuristic.
+    Query candidates retain both raw percent/form and decoded representations.
+    This does not identify general PII or arbitrary transformations of credentials.
     """
     raw: dict[str, None] = {}
 
-    def add(value: Any) -> None:
+    def add(value: Any, *, credential: bool = False) -> None:
         if not isinstance(value, str):
             return
         trimmed = value.strip(_HTTP_WHITESPACE)
-        if len(trimmed) >= _MIN_SECRET_LENGTH:
+        if trimmed and (credential or len(trimmed) >= _MIN_SECRET_LENGTH):
             raw[trimmed] = None
 
-    add(endpoint.api_key)
-    add(endpoint.session_token.token if endpoint.session_token is not None else None)
-    for value in (endpoint.headers or {}).values():
-        add(value)
-        if isinstance(value, str):
-            add(_BEARER_PREFIX.sub("", value, count=1))
+    token = endpoint.session_token
+    credential_headers = {"authorization", "api-key"}
+    add(endpoint.api_key, credential=True)
+    if token is not None:
+        add(token.token, credential=True)
+        credential_headers.add(token.header.lower())
+    effective_credentials = {
+        name: value for name, value in (headers or {}).items() if name in credential_headers
+    }
+    for source in (endpoint.headers or {}, effective_credentials):
+        for name, value in source.items():
+            credential = name.lower() in credential_headers
+            add(value, credential=credential)
+            if isinstance(value, str):
+                add(_BEARER_PREFIX.sub("", value, count=1), credential=credential)
     if url:
-        for _, value in parse_qsl(urlsplit(url).query, keep_blank_values=True):
+        query = urlsplit(url).query
+        for parameter in query.split("&"):
+            _, separator, value = parameter.partition("=")
+            if separator:
+                add(value)
+        for _, value in parse_qsl(query, keep_blank_values=True):
             add(value)
     variants: dict[str, None] = {}
     for secret in raw:
@@ -770,11 +833,35 @@ def _variant_pattern(variant: str) -> str:
 
 
 def _redact_secrets(text: str, secrets: Sequence[str]) -> str:
-    """Replaces every occurrence of any secret variant with ``[REDACTED]``, longest first."""
-    result = text
+    """Redacts original match intervals, then bounds diagnostic UTF-8 output."""
+    data = text.encode("utf-8", errors="replace")
+    return _redact_bytes(data[: MAX_ERROR_BODY_BYTES + _max_secret_bytes(secrets)], secrets)
+
+
+def _redact_bytes(data: bytes, secrets: Sequence[str]) -> str:
+    intervals: list[tuple[int, int]] = []
     for secret in secrets:
-        result = re.sub(_variant_pattern(secret), "[REDACTED]", result)
-    return result
+        if secret:
+            pattern = ("(?=(" + _variant_pattern(secret) + "))").encode("utf-8")
+            intervals.extend(match.span(1) for match in re.finditer(pattern, data))
+    unions: list[tuple[int, int]] = []
+    for start, end in sorted(intervals):
+        if unions and start < unions[-1][1]:
+            unions[-1] = (unions[-1][0], max(end, unions[-1][1]))
+        else:
+            unions.append((start, end))
+    limit = min(len(data), MAX_ERROR_BODY_BYTES)
+    chunks: list[bytes] = []
+    cursor = 0
+    for start, end in unions:
+        if start >= limit:
+            break
+        chunks.extend((data[cursor:start], b"[REDACTED]"))
+        cursor = end
+    chunks.append(data[min(cursor, limit) : limit])
+    # An incremental decoder omits an incomplete final code point at the original cap.
+    text = codecs.getincrementaldecoder("utf-8")("replace").decode(b"".join(chunks), final=False)
+    return text.encode("utf-8")[:MAX_ERROR_BODY_BYTES].decode("utf-8", errors="ignore")
 
 
 # ============================================================================
@@ -787,16 +874,22 @@ def _set_if_present(target: dict[str, Any], key: str, value: Any) -> None:
         target[key] = value
 
 
-def _serialize_part(part: Mapping[str, Any]) -> dict[str, Any]:
+def _serialize_part(
+    part: Any, allowed: tuple[str, ...], *, cache_breakpoint: bool
+) -> dict[str, Any]:
+    if not isinstance(part, Mapping) or part.get("type") not in allowed:
+        raise TypeError("Unsupported Decisions content part for this role or question.")
     part_type = part.get("type")
     if part_type == "input_text":
         out: dict[str, Any] = {"type": "input_text", "text": part["text"]}
-        _set_if_present(out, "prompt_cache_breakpoint", part.get("prompt_cache_breakpoint"))
+        if cache_breakpoint:
+            _set_if_present(out, "prompt_cache_breakpoint", part.get("prompt_cache_breakpoint"))
         return out
     if part_type == "input_image":
         out = {"type": "input_image", "image_url": part["image_url"]}
         _set_if_present(out, "detail", part.get("detail"))
-        _set_if_present(out, "prompt_cache_breakpoint", part.get("prompt_cache_breakpoint"))
+        if cache_breakpoint:
+            _set_if_present(out, "prompt_cache_breakpoint", part.get("prompt_cache_breakpoint"))
         return out
     if part_type == "input_json":
         return {"type": "input_json", "data": part["data"]}
@@ -807,23 +900,40 @@ def _serialize_part(part: Mapping[str, Any]) -> dict[str, Any]:
     raise TypeError(f"Unsupported Decisions content part type '{part_type}'.")
 
 
-def _serialize_content(content: Any) -> Any:
+def _serialize_content(
+    content: Any, allowed: tuple[str, ...], *, cache_breakpoint: bool = True
+) -> Any:
     if isinstance(content, str):
         return content
-    return [_serialize_part(part) for part in content]
+    if not isinstance(content, list):
+        raise TypeError("Decisions content must be text or a list of supported content parts.")
+    return [_serialize_part(part, allowed, cache_breakpoint=cache_breakpoint) for part in content]
 
 
-def _serialize_input_item(item: Mapping[str, Any]) -> dict[str, Any]:
+def _serialize_input_item(item: Any) -> dict[str, Any]:
+    if not isinstance(item, Mapping):
+        raise TypeError("Decisions input items must be mappings.")
     if "raw" in item:
-        return item["raw"]
+        if not isinstance(item["raw"], Mapping):
+            raise TypeError("A raw Decisions input item must contain a wire object.")
+        return dict(item["raw"])
     item_type = item.get("type")
     if item_type is None or item_type == "message":
         out: dict[str, Any] = {}
         if item_type == "message":
             out["type"] = "message"
-        out["role"] = item["role"]
-        out["content"] = _serialize_content(item["content"])
-        if item["role"] == "assistant":
+        role = item.get("role")
+        if role == "user":
+            allowed = ("input_text", "input_image", "input_json")
+        elif role in ("developer", "system"):
+            allowed = ("input_text",)
+        elif role == "assistant":
+            allowed = ("output_text", "refusal")
+        else:
+            raise TypeError("Unsupported Decisions message role.")
+        out["role"] = role
+        out["content"] = _serialize_content(item.get("content"), allowed)
+        if role == "assistant":
             _set_if_present(out, "phase", item.get("phase"))
         return out
     if item_type in ("function_call", "custom_tool_call"):
@@ -842,7 +952,7 @@ def _serialize_input_item(item: Mapping[str, Any]) -> dict[str, Any]:
         out = {
             "type": item_type,
             "call_id": item["call_id"],
-            "output": _serialize_content(item["output"]),
+            "output": _serialize_content(item.get("output"), ("input_text", "input_image")),
         }
         _set_if_present(out, "id", item.get("id"))
         _set_if_present(out, "status", item.get("status"))
@@ -851,9 +961,19 @@ def _serialize_input_item(item: Mapping[str, Any]) -> dict[str, Any]:
 
 
 def _serialize_question(question: Mapping[str, Any]) -> dict[str, Any]:
+    if not isinstance(question, Mapping) or question.get("type") not in (
+        "predicate",
+        "choice",
+        "score",
+    ):
+        raise TypeError("Unsupported Decisions question type.")
     out: dict[str, Any] = {"type": question["type"]}
     _set_if_present(out, "name", question.get("name"))
-    out["instructions"] = _serialize_content(question["instructions"])
+    out["instructions"] = _serialize_content(
+        question.get("instructions"),
+        ("input_text", "input_image", "input_json"),
+        cache_breakpoint=False,
+    )
     if question["type"] == "choice":
         choices = []
         for choice in question["choices"]:
@@ -909,6 +1029,17 @@ class _InvalidResponse(Exception):
     pass
 
 
+class _JsonFloat(float):
+    """Keeps the JSON token exact when validating integral decimal/exponent values."""
+
+    exact: Decimal
+
+    def __new__(cls, literal: str) -> _JsonFloat:
+        value = super().__new__(cls, literal)
+        value.exact = Decimal(literal)
+        return value
+
+
 def _reject_constant(value: str) -> Any:
     raise ValueError(f"Invalid JSON constant {value}")
 
@@ -916,30 +1047,45 @@ def _reject_constant(value: str) -> Any:
 def _loads_strict(text: str) -> tuple[bool, Any]:
     """Parses JSON like ``JSON.parse`` (NaN/Infinity rejected). Returns (ok, value)."""
     try:
-        return True, json.loads(text, parse_constant=_reject_constant)
-    except (ValueError, RecursionError):
+        return True, json.loads(
+            text.removeprefix("\ufeff"), parse_constant=_reject_constant, parse_float=_JsonFloat
+        )
+    except (ValueError, RecursionError, InvalidOperation):
         return False, None
 
 
 def _is_number(value: Any) -> bool:
-    return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value)
+    return not isinstance(value, bool) and (
+        isinstance(value, int) or (isinstance(value, float) and math.isfinite(value))
+    )
 
 
 def _num(obj: Mapping[str, Any], key: str) -> float:
     value: Any = obj.get(key)
     if not _is_number(value):
         raise _InvalidResponse(f"Expected number '{key}'.")
-    return float(value)
+    try:
+        number = float(value)
+    except OverflowError:
+        number = math.inf
+    if not math.isfinite(number):
+        raise _InvalidResponse(f"Expected finite number '{key}'.")
+    return number
 
 
 def _int_value(value: Any, message: str) -> int:
-    if not _is_number(value) or (isinstance(value, float) and not value.is_integer()):
+    if not _is_number(value) or not _INT64_MIN <= value <= _INT64_MAX:
         raise _InvalidResponse(message)
+    if isinstance(value, float):
+        if not value.is_integer() or abs(value) > _MAX_SAFE_INTEGER:
+            raise _InvalidResponse(message)
+        if isinstance(value, _JsonFloat) and value.exact != value.exact.to_integral_value():
+            raise _InvalidResponse(message)
     return int(value)
 
 
 def _optional_tokens(obj: Mapping[str, Any] | None, key: str) -> int:
-    if obj is None or obj.get(key) is None:
+    if obj is None or key not in obj:
         return 0
     return _int_value(obj.get(key), f"Expected integer '{key}'.")
 
@@ -1019,10 +1165,17 @@ def _parse_decisions_result(value: Any) -> DecisionsResult:
         usage = value.get("usage")
         if not isinstance(usage, dict):
             raise _InvalidResponse("Expected object 'usage'.")
-        input_details = usage.get("input_tokens_details")
-        output_details = usage.get("output_tokens_details")
-        input_details = input_details if isinstance(input_details, dict) else None
-        output_details = output_details if isinstance(output_details, dict) else None
+
+        def details(key: str) -> dict[str, Any] | None:
+            if key not in usage:
+                return None
+            result = usage[key]
+            if not isinstance(result, dict):
+                raise _InvalidResponse(f"Expected object '{key}'.")
+            return result
+
+        input_details = details("input_tokens_details")
+        output_details = details("output_tokens_details")
         answers = [_parse_answer(a) for a in _arr(value, "answers")]
         return DecisionsResult(
             answers=answers,
@@ -1059,23 +1212,18 @@ class _BodyReadError(Exception):
 
 
 async def _read_limited(response: httpx.Response, limit: int) -> tuple[bytes, bool]:
-    """Reads at most ``limit`` bytes; reports whether the stream held more data."""
-    chunks: list[bytes] = []
-    total = 0
-    exceeded = False
+    """Keeps ``limit`` bytes with one overflow byte, and closes its stream iterator."""
     try:
-        async for chunk in response.aiter_bytes():
-            remaining = limit - total
-            if len(chunk) > remaining:
-                chunks.append(chunk[:remaining])
-                total = limit
-                exceeded = True
-                break
-            chunks.append(chunk)
-            total += len(chunk)
+        chunks = response.aiter_bytes(chunk_size=limit + 1)
+        try:
+            data = await anext(chunks, b"")
+            return data[:limit], len(data) > limit
+        finally:
+            close = getattr(chunks, "aclose", None)
+            if close is not None:
+                await close()
     except Exception as error:
         raise _BodyReadError(error) from None
-    return b"".join(chunks), exceeded
 
 
 def _decode_utf8(data: bytes) -> str:
@@ -1085,7 +1233,7 @@ def _decode_utf8(data: bytes) -> str:
 async def _read_redacted_error_body(
     response: httpx.Response, secrets: Sequence[str]
 ) -> tuple[str, str, bool]:
-    """Reads an error body capped at 64 KiB, redacting before truncation.
+    """Redacts the original 64-KiB prefix, never retaining lookahead after shrinkage.
 
     A lookahead window as long as the longest secret is read past the cap so a credential
     that straddles the cap is never partially retained.
@@ -1093,12 +1241,8 @@ async def _read_redacted_error_body(
     window = MAX_ERROR_BODY_BYTES + _max_secret_bytes(secrets)
     data, exceeded = await _read_limited(response, window)
     raw = _decode_utf8(data)
-    redacted = _redact_secrets(raw, secrets)
     truncated = exceeded or len(data) > MAX_ERROR_BODY_BYTES
-    # Always cap after redaction: replacing short secrets with "[REDACTED]" can grow the
-    # text past the cap even when the raw body fit. Drop a code point split by the cut.
-    body = redacted.encode("utf-8", "surrogatepass")[:MAX_ERROR_BODY_BYTES]
-    return raw, body.decode("utf-8", errors="ignore"), truncated
+    return raw, _redact_bytes(data, secrets), truncated
 
 
 def _string_field(value: Any) -> str | None:
@@ -1113,6 +1257,61 @@ def _string_field(value: Any) -> str | None:
     if isinstance(value, float):
         return str(int(value)) if value.is_integer() and abs(value) < 1e21 else repr(value)
     return None
+
+
+_DELAY = re.compile(r"[0-9]+(?:\.[0-9]+)?")
+_IMF_FIXDATE = re.compile(
+    r"(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun), [0-9]{2} "
+    r"(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec) "
+    r"[0-9]{4} [0-9]{2}:[0-9]{2}:[0-9]{2} GMT"
+)
+
+
+def _decimal_delay_ms(value: str | None, *, seconds: bool = False) -> int | None:
+    if value is None:
+        return None
+    value = value.strip(_HTTP_WHITESPACE)
+    if not _DELAY.fullmatch(value):
+        return None
+    whole, _, fraction = value.partition(".")
+    places = 3 if seconds else 0
+    digits = (whole + fraction[:places].ljust(places, "0")).lstrip("0") or "0"
+    if len(digits) > 16:
+        return None
+    rounded = int(digits) + int(any(c != "0" for c in fraction[places:]))
+    return rounded if rounded <= _MAX_SAFE_INTEGER else None
+
+
+def _now_epoch_ms() -> int:
+    return time.time_ns() // 1_000_000
+
+
+def _parse_retry_after_ms(
+    headers: Mapping[str, str], now_epoch_ms: int | None = None
+) -> int | None:
+    """Parses advisory HTTP delays without rounding through binary floating point."""
+    normalized = {name.lower(): value for name, value in headers.items()}
+    milliseconds = _decimal_delay_ms(normalized.get("retry-after-ms"))
+    if milliseconds is not None:
+        return milliseconds
+    retry_after = normalized.get("retry-after")
+    milliseconds = _decimal_delay_ms(retry_after, seconds=True)
+    if milliseconds is not None or retry_after is None:
+        return milliseconds
+    value = retry_after.strip(_HTTP_WHITESPACE)
+    if not _IMF_FIXDATE.fullmatch(value):
+        return None
+    try:
+        date = parsedate_to_datetime(value)
+        if format_datetime(date, usegmt=True) != value:
+            return None
+        delta = date - datetime(1970, 1, 1, tzinfo=UTC)
+        target_ms = (delta.days * 86400 + delta.seconds) * 1000
+    except (ValueError, OverflowError):
+        return None
+    now = _now_epoch_ms() if now_epoch_ms is None else now_epoch_ms
+    delay = max(0, target_ms - now)
+    return delay if delay <= _MAX_SAFE_INTEGER else None
 
 
 async def _decisions_http_error(response: httpx.Response, secrets: Sequence[str]) -> DecisionsError:
@@ -1131,7 +1330,7 @@ async def _decisions_http_error(response: httpx.Response, secrets: Sequence[str]
             error_type = redact(error.get("type"))
             error_code = redact(error.get("code"))
             error_param = redact(error.get("param"))
-            error_message = redact(error.get("message"))
+            error_message = _string_field(error.get("message"))
     status = response.status_code
     status_text = (
         f"HTTP {status} (redirects are not followed)" if 300 <= status < 400 else f"HTTP {status}"
@@ -1139,24 +1338,36 @@ async def _decisions_http_error(response: httpx.Response, secrets: Sequence[str]
     suffix = f": {error_message}" if error_message else "."
     return DecisionsError(
         "http",
-        f"Decisions request failed with {status_text}{suffix}",
+        _redact_secrets(f"Decisions request failed with {status_text}{suffix}", secrets),
         status=status,
         error_type=error_type,
         error_code=error_code,
         error_param=error_param,
-        request_id=response.headers.get("x-request-id"),
+        request_id=(
+            _redact_secrets(response.headers["x-request-id"], secrets)
+            if "x-request-id" in response.headers
+            else None
+        ),
         body=body,
         body_truncated=truncated,
+        retry_after_ms=_parse_retry_after_ms(response.headers),
     )
 
 
 def _sanitize_cause(error: BaseException, secrets: Sequence[str]) -> DecisionsTransportErrorCause:
     source: BaseException = error.error if isinstance(error, _BodyReadError) else error
-    code = getattr(source, "code", None)
+    try:
+        message = str(source)
+    except Exception:
+        message = "The transport failed."
+    try:
+        code = getattr(source, "code", None)
+    except Exception:
+        code = None
     return DecisionsTransportErrorCause(
-        type(source).__name__,
-        _redact_secrets(str(source), secrets),
-        code if isinstance(code, str) else None,
+        _redact_secrets(type(source).__name__, secrets),
+        _redact_secrets(message, secrets),
+        _redact_secrets(code, secrets) if isinstance(code, str) else None,
     )
 
 
@@ -1169,7 +1380,11 @@ def _network_error(message: str, error: BaseException, secrets: Sequence[str]) -
 
 
 def _endpoint_unavailable(cause: BaseException) -> DecisionsError:
-    if _GATE_ENV in str(cause):
+    try:
+        gated = _GATE_ENV in str(cause)
+    except Exception:
+        gated = False
+    if gated:
         message = (
             "session.decisions requires the runtime's provider endpoint API. Set "
             f"{_GATE_ENV}=true in the runtime's environment (for in-process runtimes, in the "
@@ -1177,7 +1392,11 @@ def _endpoint_unavailable(cause: BaseException) -> DecisionsError:
         )
     else:
         message = "Could not resolve the session's provider endpoint for the Decisions API."
-    return DecisionsError("endpointUnavailable", message)
+    result = DecisionsError("endpointUnavailable", message)
+    result.__cause__ = DecisionsTransportErrorCause(
+        "EndpointResolutionError", "The provider endpoint lookup failed."
+    )
+    return result
 
 
 async def _close_quietly(response: httpx.Response) -> None:
@@ -1185,6 +1404,34 @@ async def _close_quietly(response: httpx.Response) -> None:
         await response.aclose()
     except Exception:
         pass
+
+
+class _DeadlineExpired(Exception):
+    pass
+
+
+def _validate_timeout(timeout: float | None) -> float | None:
+    if timeout is None:
+        return None
+    if isinstance(timeout, bool) or not isinstance(timeout, (int, float)):
+        raise TypeError("Decisions timeout must be a positive finite number or None.")
+    try:
+        value = float(timeout)
+    except OverflowError:
+        value = math.inf
+    if not math.isfinite(value) or value <= 0:
+        raise ValueError("Decisions timeout must be a positive finite number or None.")
+    return value
+
+
+def _check_deadline(deadline: asyncio.Timeout) -> None:
+    task = asyncio.current_task()
+    # asyncio.timeout owns at most one outstanding cancellation; any other is the caller's.
+    if task is not None and task.cancelling() > int(deadline.expired()):
+        raise asyncio.CancelledError
+    when = deadline.when()
+    if deadline.expired() or (when is not None and asyncio.get_running_loop().time() >= when):
+        raise _DeadlineExpired
 
 
 DecisionsEndpointResolver = Callable[
@@ -1208,7 +1455,7 @@ class SessionDecisionsApi:
         request: DecisionsRequest,
         *,
         endpoint_model_id: str | None = None,
-        timeout: float | None = None,
+        timeout: float | None = 600.0,
         http_client: httpx.AsyncClient | None = None,
     ) -> DecisionsResult:
         """**Experimental.** Calls the Decisions API (``POST {base_url}/decisions``).
@@ -1216,35 +1463,63 @@ class SessionDecisionsApi:
         Requires the runtime to run with ``COPILOT_ALLOW_GET_PROVIDER_ENDPOINT=true``.
         The provider endpoint is resolved via ``session.provider.getEndpoint`` on every
         call. On HTTP 401/403 the endpoint is resolved once more and the request is
-        replayed once (and re-billed) only if the credentials or URL changed.
+        replayed once (and re-billed) only if the credentials or URL changed and the
+        first error body was processed successfully.
+        Cancellation stops waiting for endpoint RPCs; it does not abort runtime work
+        already dispatched. Late endpoint results and failures do not dispatch HTTP.
 
         Args:
             request: The Decisions request. ``model`` is the wire model (for Azure, the
                 deployment name).
             endpoint_model_id: Passed verbatim as ``modelId`` to ``getEndpoint``. Omit to
                 use the session's current endpoint. Never derived from ``request["model"]``.
-            timeout: Overall deadline in seconds for the whole call. On expiry
-                :class:`TimeoutError` is raised.
+            timeout: Total-call deadline in seconds, including endpoint resolution,
+                both HTTP attempts, response bodies, and credential refresh.
+                Defaults to 600.0; ``None`` disables it. Must otherwise be finite
+                and positive. Expiry raises ``DecisionsError(kind="timeout")``.
             http_client: Custom :class:`httpx.AsyncClient` (proxying, testing). It is
                 trusted, never closed by the SDK, and requests are sent with
-                ``follow_redirects=False``.
+                ``follow_redirects=False``. Custom transports remain responsible
+                for their own redirect and TLS behavior; their independent timeouts
+                are reported as sanitized network failures.
 
         Returns:
             The typed result.
 
         Raises:
-            DecisionsError: On endpoint, protocol, HTTP, or network failures.
-            TypeError: If ``request`` has no ``model``.
-            ValueError: If ``request["model"]`` is empty.
+            DecisionsError: On endpoint, protocol, HTTP, network, or SDK deadline failures.
+            TypeError: If required request types or timeout types are invalid.
+            ValueError: If ``request["model"]`` is empty or timeout is not positive and finite.
             asyncio.CancelledError: If the call is cancelled (never wrapped).
-            TimeoutError: If ``timeout`` elapses.
         """
         model = _require_model(request)
-        async with asyncio.timeout(timeout):
-            if http_client is not None:
-                return await self._create(request, model, endpoint_model_id, http_client)
-            async with httpx.AsyncClient(timeout=None, follow_redirects=False) as client:
-                return await self._create(request, model, endpoint_model_id, client)
+        duration = _validate_timeout(timeout)
+        task = asyncio.current_task()
+        if task is not None and task.cancelling():
+            raise asyncio.CancelledError
+        deadline = asyncio.timeout(duration)
+        try:
+            async with deadline:
+                _check_deadline(deadline)
+                if http_client is not None:
+                    result = await self._create(
+                        request, model, endpoint_model_id, http_client, deadline
+                    )
+                else:
+                    async with httpx.AsyncClient(timeout=None, follow_redirects=False) as client:
+                        result = await self._create(
+                            request, model, endpoint_model_id, client, deadline
+                        )
+                _check_deadline(deadline)
+        except _DeadlineExpired:
+            pass
+        except TimeoutError:
+            if not deadline.expired():
+                raise
+        else:
+            return result
+        # Raise outside the handler so discarded cancellation/provider errors are not chained.
+        raise DecisionsError("timeout", "The Decisions call exceeded its SDK-owned deadline.")
 
     async def _create(
         self,
@@ -1252,36 +1527,43 @@ class SessionDecisionsApi:
         model: str,
         endpoint_model_id: str | None,
         client: httpx.AsyncClient,
+        deadline: asyncio.Timeout,
     ) -> DecisionsResult:
         params = (
             None
             if endpoint_model_id is None
             else SessionProviderGetEndpointRequest(model_id=endpoint_model_id)
         )
-        plan = _plan_attempt(await self._resolve(params), model)
+        plan = _plan_attempt(await self._resolve(params, deadline), model)
         body = json.dumps(
             _serialize_decisions_request(request),
             ensure_ascii=False,
             separators=(",", ":"),
             allow_nan=False,
         ).encode("utf-8")
-        response = await self._send(client, plan, body)
+        response = await self._send(client, plan, body, deadline)
 
         if response.status_code in (401, 403):
-            original = await self._http_error(response, plan)
-            refreshed_endpoint = await self._resolve(params)
+            original = await self._http_error(response, plan, deadline)
+            refreshed_endpoint = await self._resolve(params, deadline)
             refreshed: _AttemptPlan | None
             try:
                 refreshed = _plan_attempt(refreshed_endpoint, model)
             except Exception:
                 refreshed = None
+            _check_deadline(deadline)
             if refreshed is None or refreshed.fingerprint == plan.fingerprint:
                 raise original
-            plan = refreshed
-            response = await self._send(client, plan, body)
+            plan = _AttemptPlan(
+                refreshed.url,
+                refreshed.headers,
+                refreshed.fingerprint,
+                list(dict.fromkeys([*plan.secrets, *refreshed.secrets])),
+            )
+            response = await self._send(client, plan, body, deadline)
 
         if not 200 <= response.status_code < 300:
-            raise await self._http_error(response, plan)
+            raise await self._http_error(response, plan, deadline)
 
         failure: DecisionsError | None = None
         try:
@@ -1292,6 +1574,7 @@ class SessionDecisionsApi:
             )
         finally:
             await _close_quietly(response)
+        _check_deadline(deadline)
         if failure is not None:
             raise failure
         if exceeded:
@@ -1307,28 +1590,43 @@ class SessionDecisionsApi:
             )
         return _parse_decisions_result(value)
 
-    async def _http_error(self, response: httpx.Response, plan: _AttemptPlan) -> DecisionsError:
+    async def _http_error(
+        self, response: httpx.Response, plan: _AttemptPlan, deadline: asyncio.Timeout
+    ) -> DecisionsError:
         failure: DecisionsError | None = None
         try:
-            return await _decisions_http_error(response, plan.secrets)
+            result = await _decisions_http_error(response, plan.secrets)
         except _BodyReadError as error:
             failure = _network_error(
                 "The Decisions error response could not be read.", error, plan.secrets
             )
         finally:
             await _close_quietly(response)
-        raise failure
+        _check_deadline(deadline)
+        if failure is not None:
+            raise failure
+        return result
 
-    async def _resolve(self, params: SessionProviderGetEndpointRequest | None) -> ProviderEndpoint:
+    async def _resolve(
+        self, params: SessionProviderGetEndpointRequest | None, deadline: asyncio.Timeout
+    ) -> ProviderEndpoint:
+        _check_deadline(deadline)
+        failure: DecisionsError | None = None
         try:
-            return await self._resolve_endpoint(params)
+            result = await self._resolve_endpoint(params)
         except Exception as error:
-            raise _endpoint_unavailable(error) from error
+            failure = _endpoint_unavailable(error)
+        _check_deadline(deadline)
+        if failure is not None:
+            raise failure
+        return result
 
     async def _send(
-        self, client: httpx.AsyncClient, plan: _AttemptPlan, body: bytes
+        self, client: httpx.AsyncClient, plan: _AttemptPlan, body: bytes, deadline: asyncio.Timeout
     ) -> httpx.Response:
+        _check_deadline(deadline)
         failure: DecisionsError | None = None
+        response: httpx.Response | None = None
         try:
             request = client.build_request(
                 "POST",
@@ -1339,9 +1637,19 @@ class SessionDecisionsApi:
                 ],
                 content=body,
             )
-            return await client.send(request, stream=True, follow_redirects=False)
+            _check_deadline(deadline)
+            response = await client.send(request, stream=True, follow_redirects=False)
         except Exception as error:
             failure = _network_error(
                 "The Decisions request could not be sent.", error, plan.secrets
             )
-        raise failure
+        try:
+            _check_deadline(deadline)
+        except BaseException:
+            if response is not None:
+                await _close_quietly(response)
+            raise
+        if failure is not None:
+            raise failure
+        assert response is not None
+        return response

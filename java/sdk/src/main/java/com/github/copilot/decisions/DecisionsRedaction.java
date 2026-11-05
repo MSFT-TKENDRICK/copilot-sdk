@@ -15,7 +15,7 @@ import java.util.regex.Pattern;
 
 /**
  * Credential redaction shared by every SDK language: secret variants, case
- * insensitive escape matching, and longest-first replacement.
+ * insensitive escape matching, and union of overlapping original matches.
  */
 final class DecisionsRedaction {
 
@@ -61,11 +61,15 @@ final class DecisionsRedaction {
 
     /** Adds {@code value} to {@code raw} if it is a secret candidate. */
     static void addCandidate(Set<String> raw, String value) {
+        addCandidate(raw, value, false);
+    }
+
+    static void addCandidate(Set<String> raw, String value, boolean credential) {
         if (value == null) {
             return;
         }
         String trimmed = trimOws(value);
-        if (trimmed.codePointCount(0, trimmed.length()) >= MIN_SECRET_LENGTH) {
+        if (!trimmed.isEmpty() && (credential || trimmed.codePointCount(0, trimmed.length()) >= MIN_SECRET_LENGTH)) {
             raw.add(trimmed);
         }
     }
@@ -240,12 +244,80 @@ final class DecisionsRedaction {
 
     /** Replaces every occurrence of every variant with {@code [REDACTED]}. */
     static String redact(String text, List<String> secrets) {
-        String result = text;
+        return redactPrefix(text, text.length(), secrets);
+    }
+
+    /** Matches against the original text, retaining only its requested prefix. */
+    static String redactPrefix(String text, int retainedCharacters, List<String> secrets) {
+        int[] ends = new int[text.length()];
         for (String secret : secrets) {
-            result = Pattern.compile(variantPattern(secret)).matcher(result)
-                    .replaceAll(Matcher.quoteReplacement(REDACTED));
+            if (secret.isEmpty()) {
+                continue;
+            }
+            Matcher matches = Pattern.compile("(?=(" + variantPattern(secret) + "))").matcher(text);
+            while (matches.find()) {
+                int start = matches.start(1);
+                ends[start] = Math.max(ends[start], matches.end(1));
+            }
         }
-        return result;
+        StringBuilder out = new StringBuilder(retainedCharacters);
+        int cursor = 0;
+        while (cursor < retainedCharacters) {
+            int end = ends[cursor];
+            if (end <= cursor) {
+                out.append(text.charAt(cursor++));
+                continue;
+            }
+            for (int next = cursor + 1; next < end; next++) {
+                end = Math.max(end, ends[next]);
+            }
+            out.append(REDACTED);
+            cursor = end;
+        }
+        return out.toString();
+    }
+
+    /** Bounds and redacts a provider-controlled diagnostic, including lookahead. */
+    static String sanitize(String text, List<String> secrets) {
+        if (text == null) {
+            return null;
+        }
+        int retained = prefixLength(text, SessionDecisions.MAX_ERROR_BODY_BYTES);
+        int window = prefixLength(text, (long) SessionDecisions.MAX_ERROR_BODY_BYTES + maxSecretBytes(secrets));
+        return capUtf8(redactPrefix(text.substring(0, window), retained, secrets),
+                SessionDecisions.MAX_ERROR_BODY_BYTES);
+    }
+
+    private static int prefixLength(String text, long byteLimit) {
+        long bytes = 0;
+        int i = 0;
+        while (i < text.length()) {
+            char c = text.charAt(i);
+            boolean pair = Character.isHighSurrogate(c) && i + 1 < text.length()
+                    && Character.isLowSurrogate(text.charAt(i + 1));
+            int size = pair ? 4 : c < 0x80 || Character.isSurrogate(c) ? 1 : c < 0x800 ? 2 : 3;
+            if (bytes + size > byteLimit) {
+                break;
+            }
+            bytes += size;
+            i += pair ? 2 : 1;
+        }
+        return i;
+    }
+
+    static int utf8Cut(byte[] bytes, int limit) {
+        int cut = Math.min(bytes.length, limit);
+        if (cut < bytes.length) {
+            while (cut > 0 && (bytes[cut] & 0xC0) == 0x80) {
+                cut--;
+            }
+        }
+        return cut;
+    }
+
+    static String capUtf8(String text, int limit) {
+        byte[] encoded = text.getBytes(StandardCharsets.UTF_8);
+        return encoded.length <= limit ? text : new String(encoded, 0, utf8Cut(encoded, limit), StandardCharsets.UTF_8);
     }
 
     /** UTF-8 byte length of the longest variant. */

@@ -13,13 +13,17 @@ import (
 	"fmt"
 	"io"
 	"math"
+	"net"
 	"net/http"
+	"net/netip"
 	"net/url"
 	"regexp"
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
+	"time"
 	"unicode/utf16"
 	"unicode/utf8"
 
@@ -30,10 +34,23 @@ const (
 	decisionsMaxErrorBodyBytes = 64 * 1024
 	decisionsMaxResponseBytes  = 8 * 1024 * 1024
 	decisionsMinSecretRunes    = 8
+	decisionsDefaultTimeout    = 600 * time.Second
+	decisionsMaxSafeInteger    = int64(9007199254740991)
 	decisionsRedacted          = "[REDACTED]"
 	decisionsGateEnv           = "COPILOT_ALLOW_GET_PROVIDER_ENDPOINT"
 	decisionsGateHint          = "session.decisions requires the runtime's provider endpoint API. Set COPILOT_ALLOW_GET_PROVIDER_ENDPOINT=true in the runtime's environment (for in-process runtimes, in the host process environment before the runtime is loaded)."
 )
+
+// Connection pooling follows net/http defaults; active I/O is bounded only by the call
+// context, rather than an unrelated dial, TLS-handshake, or response-header timeout.
+var decisionsDefaultHTTPTransport = &http.Transport{
+	Proxy:                 http.ProxyFromEnvironment,
+	DialContext:           (&net.Dialer{KeepAlive: 30 * time.Second}).DialContext,
+	ForceAttemptHTTP2:     true,
+	MaxIdleConns:          100,
+	IdleConnTimeout:       90 * time.Second,
+	ExpectContinueTimeout: time.Second,
+}
 
 // DecisionsErrorKind classifies a [DecisionsError].
 //
@@ -60,11 +77,15 @@ const (
 	DecisionsErrorKindInvalidResponse DecisionsErrorKind = "invalidResponse"
 	// DecisionsErrorKindNetwork means the request or response body failed in transit.
 	DecisionsErrorKindNetwork DecisionsErrorKind = "network"
+	// DecisionsErrorKindTimeout means the SDK-owned total-call deadline expired.
+	DecisionsErrorKindTimeout DecisionsErrorKind = "timeout"
 )
 
-// DecisionsError is returned by [SessionDecisions.Create] for endpoint, HTTP, network, and
-// response failures. Credentials are redacted from every field. Cancellation is never wrapped
-// in a DecisionsError; the context error is returned directly.
+// DecisionsError reports endpoint, HTTP, network, response, and SDK timeout failures.
+// Known endpoint credentials are redacted, including short credentials and supported encoded
+// forms. Other header/query values use an eight-Unicode-scalar heuristic. This is not general
+// PII removal or protection against arbitrary transformations of credentials.
+// Caller context cancellation and deadlines are returned natively, not wrapped.
 //
 // Experimental: DecisionsError is part of the experimental Decisions API and may change or be
 // removed.
@@ -80,8 +101,12 @@ type DecisionsError struct {
 	// Body is the redacted error body, at most 64 KiB.
 	Body          string
 	BodyTruncated bool
-	// Cause is the underlying error. For network failures it is a sanitized
-	// *DecisionsNetworkCause; for endpointUnavailable it is the endpoint resolution error.
+	// RetryAfterMS is advisory HTTP retry guidance in milliseconds, not an automatic retry.
+	// Nil means no valid hint was supplied.
+	RetryAfterMS *int64
+	// Cause is a sanitized *DecisionsNetworkCause for network failures or a fixed safe
+	// diagnostic for endpointUnavailable. Original exception objects are never retained.
+	// SDK timeout errors have no cause.
 	Cause error
 }
 
@@ -92,7 +117,7 @@ func (e *DecisionsError) Error() string { return e.Message }
 func (e *DecisionsError) Unwrap() error { return e.Cause }
 
 // DecisionsNetworkCause is a sanitized network failure: credentials are redacted from
-// Message and the original error is not retained.
+// all fields and the original error is not retained. Each field is bounded to 64 KiB.
 //
 // Experimental: DecisionsNetworkCause is part of the experimental Decisions API and may
 // change or be removed.
@@ -116,8 +141,16 @@ type DecisionsOptions struct {
 	// EndpointModelID selects which model's provider endpoint to resolve. Empty resolves the
 	// session's current model.
 	EndpointModelID string
-	// Transport sends the HTTP request. Nil uses [http.DefaultTransport].
+	// Transport sends the HTTP request. Nil uses the SDK's pooled HTTP transport,
+	// whose active I/O is bounded by the call context rather than a separate timeout.
+	// Custom transports are trusted to enforce TLS/redirect policy and honor the request
+	// context. Their response bodies must support Close concurrently with Read.
 	Transport http.RoundTripper
+	// Timeout is the total-call deadline, including endpoint resolution, HTTP response
+	// bodies, and the single conditional authentication replay. Nil defaults to 600 seconds;
+	// a pointer to zero disables the SDK deadline. Negative values are invalid.
+	// Caller context cancellation/deadlines take precedence over the SDK deadline.
+	Timeout *time.Duration
 }
 
 // SessionDecisions issues Decisions API requests through a session's provider endpoint.
@@ -126,6 +159,7 @@ type DecisionsOptions struct {
 // be removed.
 type SessionDecisions struct {
 	resolve func(ctx context.Context, params *rpc.SessionProviderGetEndpointRequest) (*rpc.ProviderEndpoint, error)
+	now     func() time.Time
 }
 
 type decisionsAttempt struct {
@@ -136,17 +170,41 @@ type decisionsAttempt struct {
 }
 
 // Create sends a Decisions request and returns the parsed answers. The provider endpoint is
-// resolved on every call; on a 401 or 403 it is resolved once more and the request retried
-// once if the credentials changed.
+// resolved on every call; after a readable 401 or 403 it is resolved once more and the
+// request retried once if the effective URL or credentials changed. No other retry occurs.
+// The default total-call deadline is 600 seconds.
 //
 // Experimental: Create is part of the experimental Decisions API and may change or be removed.
-func (d *SessionDecisions) Create(ctx context.Context, req DecisionsRequest, opts *DecisionsOptions) (*DecisionsResult, error) {
+func (d *SessionDecisions) Create(ctx context.Context, req DecisionsRequest, opts *DecisionsOptions) (result *DecisionsResult, err error) {
 	if req.Model == "" {
 		return nil, errDecisionsModelRequired
 	}
 	if opts == nil {
 		opts = &DecisionsOptions{}
 	}
+	timeout := decisionsDefaultTimeout
+	if opts.Timeout != nil {
+		timeout = *opts.Timeout
+	}
+	if timeout < 0 {
+		return nil, errors.New("DecisionsOptions.Timeout must not be negative")
+	}
+	callerCtx := ctx
+	if err := callerCtx.Err(); err != nil {
+		return nil, err
+	}
+	if timeout > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, timeout)
+		defer cancel()
+	}
+	defer func() {
+		if callerErr := callerCtx.Err(); callerErr != nil {
+			result, err = nil, callerErr
+		} else if ctx.Err() != nil {
+			result, err = nil, &DecisionsError{Kind: DecisionsErrorKindTimeout, Message: "The Decisions call exceeded its total-call timeout."}
+		}
+	}()
 	var params *rpc.SessionProviderGetEndpointRequest
 	if opts.EndpointModelID != "" {
 		id := opts.EndpointModelID
@@ -168,10 +226,10 @@ func (d *SessionDecisions) Create(ctx context.Context, req DecisionsRequest, opt
 
 	transport := opts.Transport
 	if transport == nil {
-		transport = http.DefaultTransport
+		transport = decisionsDefaultHTTPTransport
 	}
 	client := &http.Client{
-		Transport: transport,
+		Transport: decisionsTransport{transport},
 		CheckRedirect: func(*http.Request, []*http.Request) error {
 			return http.ErrUseLastResponse
 		},
@@ -182,8 +240,9 @@ func (d *SessionDecisions) Create(ctx context.Context, req DecisionsRequest, opt
 		return nil, err
 	}
 	if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
-		original := decisionsHTTPError(ctx, resp, attempt.secrets)
-		if isContextErr(ctx, original) {
+		original := decisionsHTTPError(ctx, resp, attempt.secrets, d.currentTime)
+		var httpErr *DecisionsError
+		if !errors.As(original, &httpErr) || httpErr.Kind != DecisionsErrorKindHTTP {
 			return nil, original
 		}
 		refreshed, err := d.resolveEndpoint(ctx, params)
@@ -194,6 +253,7 @@ func (d *SessionDecisions) Create(ctx context.Context, req DecisionsRequest, opt
 		if planErr != nil || next.fingerprint == attempt.fingerprint {
 			return nil, original
 		}
+		next.secrets = append(next.secrets, attempt.secrets...)
 		attempt = next
 		resp, err = sendDecisions(ctx, client, attempt, body)
 		if err != nil {
@@ -201,13 +261,16 @@ func (d *SessionDecisions) Create(ctx context.Context, req DecisionsRequest, opt
 		}
 	}
 	if resp.StatusCode < 200 || resp.StatusCode > 299 {
-		return nil, decisionsHTTPError(ctx, resp, attempt.secrets)
+		return nil, decisionsHTTPError(ctx, resp, attempt.secrets, d.currentTime)
 	}
 	return readDecisionsSuccess(ctx, resp, attempt.secrets)
 }
 
-func isContextErr(ctx context.Context, err error) bool {
-	return ctx.Err() != nil && err == ctx.Err()
+func (d *SessionDecisions) currentTime() time.Time {
+	if d.now != nil {
+		return d.now()
+	}
+	return time.Now()
 }
 
 func (d *SessionDecisions) resolveEndpoint(ctx context.Context, params *rpc.SessionProviderGetEndpointRequest) (*rpc.ProviderEndpoint, error) {
@@ -223,7 +286,10 @@ func (d *SessionDecisions) resolveEndpoint(ctx context.Context, params *rpc.Sess
 		if strings.Contains(err.Error(), decisionsGateEnv) {
 			message = decisionsGateHint
 		}
-		return nil, &DecisionsError{Kind: DecisionsErrorKindEndpointUnavailable, Message: message, Cause: err}
+		return nil, &DecisionsError{
+			Kind: DecisionsErrorKindEndpointUnavailable, Message: message,
+			Cause: errors.New("Provider endpoint resolution failed."),
+		}
 	}
 	if endpoint == nil {
 		return nil, &DecisionsError{Kind: DecisionsErrorKindEndpointUnavailable, Message: "Could not resolve the session's provider endpoint for the Decisions API."}
@@ -231,7 +297,29 @@ func (d *SessionDecisions) resolveEndpoint(ctx context.Context, params *rpc.Sess
 	return endpoint, nil
 }
 
+type decisionsTransport struct{ http.RoundTripper }
+
+func (t decisionsTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	if err := req.Context().Err(); err != nil {
+		return nil, err
+	}
+	resp, err := t.RoundTripper.RoundTrip(req)
+	if ctxErr := req.Context().Err(); ctxErr != nil {
+		err = ctxErr
+	}
+	if err != nil && resp != nil {
+		if resp.Body != nil {
+			_ = resp.Body.Close()
+		}
+		return nil, err
+	}
+	return resp, err
+}
+
 func sendDecisions(ctx context.Context, client *http.Client, attempt *decisionsAttempt, body []byte) (*http.Response, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, attempt.url, bytes.NewReader(body))
 	if err != nil {
 		return nil, &DecisionsError{Kind: DecisionsErrorKindInvalidEndpoint, Message: "The provider endpoint base URL is not a valid absolute URL."}
@@ -264,10 +352,10 @@ func sanitizeDecisionsCause(err error, secrets []string) *DecisionsNetworkCause 
 		break
 	}
 	cause := &DecisionsNetworkCause{
-		Name:    fmt.Sprintf("%T", inner),
+		Name:    redactDecisionsText(fmt.Sprintf("%T", inner), secrets),
 		Message: redactDecisionsText(inner.Error(), secrets),
 	}
-	cause.Code = decisionsErrnoCode(err)
+	cause.Code = redactDecisionsText(decisionsErrnoCode(err), secrets)
 	return cause
 }
 
@@ -302,33 +390,27 @@ func decisionsErrnoCode(err error) string {
 	return ""
 }
 
-func decisionsHTTPError(ctx context.Context, resp *http.Response, secrets []string) error {
-	defer resp.Body.Close()
+func decisionsHTTPError(ctx context.Context, resp *http.Response, secrets []string, now func() time.Time) error {
 	window := decisionsMaxErrorBodyBytes + maxSecretBytes(secrets)
-	raw, err := io.ReadAll(io.LimitReader(resp.Body, int64(window)+1))
+	raw, err := readDecisionsBody(ctx, resp.Body, int64(window)+1)
 	if err != nil {
 		if ctxErr := ctx.Err(); ctxErr != nil {
 			return ctxErr
 		}
 		return decisionsNetworkError("The Decisions error response could not be read.", err, secrets)
 	}
-	exceeded := len(raw) > window
-	if exceeded {
-		raw = raw[:window]
-	}
-	text := redactDecisionsText(decodeDecisionsLossy(raw), secrets)
-	truncated := exceeded || len(raw) > decisionsMaxErrorBodyBytes
-	// Cut even when not truncated: replacing short secrets with "[REDACTED]" can grow the text.
-	text = truncateUTF8(text, decisionsMaxErrorBodyBytes)
+	truncated := len(raw) > decisionsMaxErrorBodyBytes
+	text := redactDecisionsText(string(raw), secrets)
 
 	result := &DecisionsError{
 		Kind:          DecisionsErrorKindHTTP,
 		Status:        resp.StatusCode,
 		Body:          text,
 		BodyTruncated: truncated,
+		RetryAfterMS:  decisionsRetryAfter(resp.Header, now()),
 	}
 	if values, ok := resp.Header[http.CanonicalHeaderKey("x-request-id")]; ok {
-		id := strings.Join(values, ", ")
+		id := redactDecisionsText(strings.Join(values, ", "), secrets)
 		result.RequestID = &id
 	}
 	var message *string
@@ -340,7 +422,7 @@ func decisionsHTTPError(ctx context.Context, resp *http.Response, secrets []stri
 				result.ErrorType = redactedStringField(errObj["type"], secrets)
 				result.ErrorCode = redactedStringField(errObj["code"], secrets)
 				result.ErrorParam = redactedStringField(errObj["param"], secrets)
-				message = redactedStringField(errObj["message"], secrets)
+				message = decisionsStringField(errObj["message"])
 			}
 		}
 	}
@@ -349,14 +431,22 @@ func decisionsHTTPError(ctx context.Context, resp *http.Response, secrets []stri
 		prefix += " (redirects are not followed)"
 	}
 	if message != nil && *message != "" {
-		result.Message = prefix + ": " + *message
+		result.Message = redactDecisionsText(prefix+": "+*message, secrets)
 	} else {
-		result.Message = prefix + "."
+		result.Message = redactDecisionsText(prefix+".", secrets)
 	}
 	return result
 }
 
 func redactedStringField(raw json.RawMessage, secrets []string) *string {
+	value := decisionsStringField(raw)
+	if value != nil {
+		*value = redactDecisionsText(*value, secrets)
+	}
+	return value
+}
+
+func decisionsStringField(raw json.RawMessage) *string {
 	if raw == nil {
 		return nil
 	}
@@ -375,8 +465,58 @@ func redactedStringField(raw json.RawMessage, secrets []string) *string {
 	default:
 		return nil
 	}
-	s = redactDecisionsText(s, secrets)
 	return &s
+}
+
+func decisionsRetryAfter(headers http.Header, now time.Time) *int64 {
+	if value, ok := decisionsRetryDelay(headers.Get("retry-after-ms"), 1); ok {
+		return &value
+	}
+	raw := trimHTTPWhitespace(headers.Get("retry-after"))
+	if value, ok := decisionsRetryDelay(raw, 1000); ok {
+		return &value
+	}
+	date, err := time.Parse(http.TimeFormat, raw)
+	if err != nil || date.UTC().Format(http.TimeFormat) != raw {
+		return nil
+	}
+	delay := max(int64(0), date.UnixMilli()-now.UnixMilli())
+	if delay > decisionsMaxSafeInteger {
+		return nil
+	}
+	return &delay
+}
+
+func decisionsRetryDelay(raw string, scale int64) (int64, bool) {
+	raw = trimHTTPWhitespace(raw)
+	whole, fraction, dot := strings.Cut(raw, ".")
+	isDecimal := func(s string) bool {
+		return s != "" && strings.IndexFunc(s, func(r rune) bool { return r < '0' || r > '9' }) < 0
+	}
+	if !isDecimal(whole) || (dot && !isDecimal(fraction)) {
+		return 0, false
+	}
+	whole = strings.TrimLeft(whole, "0")
+	if whole == "" {
+		whole = "0"
+	}
+	value, err := strconv.ParseInt(whole, 10, 64)
+	if err != nil || value > decisionsMaxSafeInteger/scale {
+		return 0, false
+	}
+	value *= scale
+	if scale == 1000 {
+		for i := 0; i < 3; i++ {
+			if i < len(fraction) {
+				value += int64(fraction[i]-'0') * []int64{100, 10, 1}[i]
+			}
+		}
+		fraction = fraction[min(len(fraction), 3):]
+	}
+	if strings.Trim(fraction, "0") != "" {
+		value++
+	}
+	return value, value <= decisionsMaxSafeInteger
 }
 
 // jsNumberString approximates JavaScript's String(number).
@@ -397,8 +537,7 @@ func jsNumberString(v float64) string {
 }
 
 func readDecisionsSuccess(ctx context.Context, resp *http.Response, secrets []string) (*DecisionsResult, error) {
-	defer resp.Body.Close()
-	raw, err := io.ReadAll(io.LimitReader(resp.Body, decisionsMaxResponseBytes+1))
+	raw, err := readDecisionsBody(ctx, resp.Body, decisionsMaxResponseBytes+1)
 	if err != nil {
 		if ctxErr := ctx.Err(); ctxErr != nil {
 			return nil, ctxErr
@@ -413,6 +552,39 @@ func readDecisionsSuccess(ctx context.Context, resp *http.Response, secrets []st
 		return nil, decisionsInvalidResponse("The Decisions API returned a response that is not valid JSON.")
 	}
 	return parseDecisionsResult([]byte(text))
+}
+
+type decisionsContextReader struct {
+	ctx context.Context
+	io.Reader
+}
+
+func (r decisionsContextReader) Read(p []byte) (int, error) {
+	if err := r.ctx.Err(); err != nil {
+		return 0, err
+	}
+	return r.Reader.Read(p)
+}
+
+func readDecisionsBody(ctx context.Context, body io.ReadCloser, limit int64) ([]byte, error) {
+	closeBody := sync.OnceFunc(func() { _ = body.Close() })
+	closed := make(chan struct{})
+	stop := context.AfterFunc(ctx, func() {
+		closeBody()
+		close(closed)
+	})
+	defer func() {
+		if !stop() {
+			// Join the cancellation closer; no body reader or detached worker is spawned.
+			<-closed
+		}
+		closeBody()
+	}()
+	raw, err := io.ReadAll(io.LimitReader(decisionsContextReader{ctx, body}, limit))
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return nil, ctxErr
+	}
+	return raw, err
 }
 
 func decisionsInvalidResponse(message string) *DecisionsError {
@@ -434,6 +606,16 @@ func trimHTTPWhitespace(value string) string {
 }
 
 func buildDecisionsURL(endpointType rpc.ProviderEndpointType, baseURL string) (string, error) {
+	schemeEnd := strings.Index(baseURL, "://")
+	if schemeEnd < 0 || (!strings.EqualFold(baseURL[:schemeEnd], "http") && !strings.EqualFold(baseURL[:schemeEnd], "https")) {
+		return "", decisionsInvalidEndpoint("The provider endpoint base URL must be an absolute http or https URL.")
+	}
+	for i := 0; i < len(baseURL); i++ {
+		c := baseURL[i]
+		if c <= 0x20 || c >= 0x7f || c == '\\' || (c == '%' && (i+2 >= len(baseURL) || !isHex(baseURL[i+1]) || !isHex(baseURL[i+2]))) {
+			return "", decisionsInvalidEndpoint("The provider endpoint base URL contains invalid URI characters.")
+		}
+	}
 	u, err := url.Parse(baseURL)
 	if err != nil || !u.IsAbs() {
 		return "", decisionsInvalidEndpoint("The provider endpoint base URL is not a valid absolute URL.")
@@ -446,13 +628,47 @@ func buildDecisionsURL(endpointType rpc.ProviderEndpointType, baseURL string) (s
 		return "", decisionsInvalidEndpoint("The provider endpoint base URL must not contain credentials.")
 	}
 	host := strings.ToLower(u.Hostname())
-	if strings.Contains(host, ":") {
-		host = "[" + host + "]"
+	authority := rawDecisionsAuthority(baseURL)
+	portText := ""
+	hasPort := false
+	if strings.HasPrefix(authority, "[") {
+		end := strings.IndexByte(authority, ']')
+		ip, err := netip.ParseAddr(host)
+		if end < 0 || err != nil || !ip.Is6() {
+			return "", decisionsInvalidEndpoint("The provider endpoint base URL has an invalid host.")
+		}
+		for _, c := range ip.Zone() {
+			if !(c >= 'a' && c <= 'z') && !(c >= '0' && c <= '9') && !strings.ContainsRune("-._~", c) {
+				return "", decisionsInvalidEndpoint("The provider endpoint base URL has an invalid IPv6 zone.")
+			}
+		}
+		rest := authority[end+1:]
+		if rest != "" {
+			if !strings.HasPrefix(rest, ":") {
+				return "", decisionsInvalidEndpoint("The provider endpoint base URL has an invalid authority.")
+			}
+			portText, hasPort = rest[1:], true
+		}
+		host = "[" + strings.ReplaceAll(host, "%", "%25") + "]"
+	} else {
+		if strings.Count(authority, ":") > 1 || !validDecisionsHostname(host) {
+			return "", decisionsInvalidEndpoint("The provider endpoint base URL has an invalid host.")
+		}
+		_, portText, hasPort = strings.Cut(authority, ":")
 	}
-	if port := u.Port(); port != "" && !(scheme == "https" && port == "443") && !(scheme == "http" && port == "80") {
-		host += ":" + port
+	if hasPort {
+		if portText == "" || strings.IndexFunc(portText, func(r rune) bool { return r < '0' || r > '9' }) >= 0 {
+			return "", decisionsInvalidEndpoint("The provider endpoint base URL has an invalid port.")
+		}
+		port, err := strconv.ParseUint(portText, 10, 16)
+		if err != nil {
+			return "", decisionsInvalidEndpoint("The provider endpoint base URL has an invalid port.")
+		}
+		if !(scheme == "https" && port == 443) && !(scheme == "http" && port == 80) {
+			host += ":" + strconv.FormatUint(port, 10)
+		}
 	}
-	basePath := strings.TrimRight(u.EscapedPath(), "/")
+	basePath := strings.TrimRight(normalizeDecisionsPath(u.EscapedPath()), "/")
 	suffix := "/decisions"
 	if endpointType == rpc.ProviderEndpointTypeAzure && !strings.HasSuffix(strings.ToLower(basePath), "/openai/v1") {
 		suffix = "/openai/v1/decisions"
@@ -462,6 +678,42 @@ func buildDecisionsURL(endpointType rpc.ProviderEndpointType, baseURL string) (s
 		result += "?" + u.RawQuery
 	}
 	return result, nil
+}
+
+func validDecisionsHostname(host string) bool {
+	host = strings.TrimSuffix(host, ".")
+	if host == "" || len(host) > 253 {
+		return false
+	}
+	for _, label := range strings.Split(host, ".") {
+		if len(label) == 0 || len(label) > 63 || label[0] == '-' || label[len(label)-1] == '-' {
+			return false
+		}
+		for _, c := range label {
+			if !(c >= 'a' && c <= 'z') && !(c >= '0' && c <= '9') && c != '-' {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+func normalizeDecisionsPath(path string) string {
+	var segments []string
+	for _, segment := range strings.Split(path, "/") {
+		dots := strings.ReplaceAll(strings.ReplaceAll(segment, "%2e", "."), "%2E", ".")
+		switch dots {
+		case ".":
+			continue
+		case "..":
+			if len(segments) > 1 {
+				segments = segments[:len(segments)-1]
+			}
+		default:
+			segments = append(segments, segment)
+		}
+	}
+	return strings.Join(segments, "/")
 }
 
 func rawDecisionsAuthority(rawURL string) string {
@@ -476,8 +728,13 @@ func rawDecisionsAuthority(rawURL string) string {
 }
 
 func checkDecisionsHeader(name, value string) (string, error) {
-	if !decisionsHeaderName.MatchString(name) || strings.ContainsAny(value, "\r\n\x00") {
+	if !decisionsHeaderName.MatchString(name) || !utf8.ValidString(value) {
 		return "", decisionsInvalidEndpoint("The provider endpoint returned an invalid HTTP header.")
+	}
+	for _, c := range value {
+		if (c < 0x20 && c != '\t') || c == 0x7f {
+			return "", decisionsInvalidEndpoint("The provider endpoint returned an invalid HTTP header.")
+		}
 	}
 	return trimHTTPWhitespace(value), nil
 }
@@ -495,6 +752,11 @@ func (h *decisionsHeaderSet) set(name, value string) {
 }
 
 func buildDecisionsHeaders(endpoint *rpc.ProviderEndpoint) (*decisionsHeaderSet, error) {
+	if endpoint.APIKey != nil {
+		if _, err := checkDecisionsHeader("api-key", *endpoint.APIKey); err != nil {
+			return nil, err
+		}
+	}
 	merged := &decisionsHeaderSet{values: map[string]string{}}
 	names := make([]string, 0, len(endpoint.Headers))
 	for name := range endpoint.Headers {
@@ -559,20 +821,19 @@ func planDecisionsAttempt(endpoint *rpc.ProviderEndpoint, model string) (*decisi
 	if endpoint.Type != rpc.ProviderEndpointTypeOpenai && endpoint.Type != rpc.ProviderEndpointTypeAzure {
 		return nil, &DecisionsError{
 			Kind:    DecisionsErrorKindUnsupportedProvider,
-			Message: fmt.Sprintf("The session's provider type '%s' does not support the Decisions API.", endpoint.Type),
+			Message: "The session's provider type does not support the Decisions API.",
 		}
 	}
 	if endpoint.Transport != nil && *endpoint.Transport != rpc.ProviderEndpointTransportHTTP {
 		return nil, &DecisionsError{
 			Kind:    DecisionsErrorKindUnsupportedTransport,
-			Message: fmt.Sprintf("The session's provider transport '%s' is not supported by the Decisions API.", *endpoint.Transport),
+			Message: "The session's provider transport is not supported by the Decisions API.",
 		}
 	}
 	if endpoint.SessionToken != nil && endpoint.SessionToken.Model != nil && *endpoint.SessionToken.Model != model {
 		return nil, &DecisionsError{
-			Kind: DecisionsErrorKindModelMismatch,
-			Message: fmt.Sprintf("The provider session token is bound to model '%s', but the request uses '%s'. Set endpointModelId or request.model consistently.",
-				*endpoint.SessionToken.Model, model),
+			Kind:    DecisionsErrorKindModelMismatch,
+			Message: "The provider session token is bound to a different model. Set EndpointModelID and request Model consistently.",
 		}
 	}
 	target, err := buildDecisionsURL(endpoint.Type, endpoint.BaseURL)
@@ -620,18 +881,26 @@ var decisionsBearerPrefix = regexp.MustCompile(`(?i)^[ \t]*bearer[ \t]+`)
 func collectDecisionsSecrets(endpoint *rpc.ProviderEndpoint, target string) []string {
 	var raw []string
 	seen := map[string]bool{}
-	add := func(value string) {
+	add := func(value string, credential bool) {
 		trimmed := trimHTTPWhitespace(value)
-		if utf8.RuneCountInString(trimmed) >= decisionsMinSecretRunes && !seen[trimmed] {
+		if trimmed != "" && (credential || utf8.RuneCountInString(trimmed) >= decisionsMinSecretRunes) && !seen[trimmed] {
 			seen[trimmed] = true
 			raw = append(raw, trimmed)
 		}
 	}
 	if endpoint.APIKey != nil {
-		add(*endpoint.APIKey)
+		add(*endpoint.APIKey, true)
+		if endpoint.Type == rpc.ProviderEndpointTypeOpenai && trimHTTPWhitespace(*endpoint.APIKey) != "" {
+			add("Bearer "+trimHTTPWhitespace(*endpoint.APIKey), true)
+		}
 	}
+	tokenHeader := ""
 	if endpoint.SessionToken != nil {
-		add(endpoint.SessionToken.Token)
+		add(endpoint.SessionToken.Token, true)
+		tokenHeader = strings.ToLower(endpoint.SessionToken.Header)
+		if tokenHeader == "authorization" {
+			add(decisionsBearerPrefix.ReplaceAllString(endpoint.SessionToken.Token, ""), true)
+		}
 	}
 	names := make([]string, 0, len(endpoint.Headers))
 	for name := range endpoint.Headers {
@@ -640,12 +909,19 @@ func collectDecisionsSecrets(endpoint *rpc.ProviderEndpoint, target string) []st
 	sort.Strings(names)
 	for _, name := range names {
 		value := endpoint.Headers[name]
-		add(value)
-		add(decisionsBearerPrefix.ReplaceAllString(value, ""))
+		lower := strings.ToLower(name)
+		credential := lower == "authorization" || lower == "api-key" || lower == tokenHeader
+		add(value, credential)
+		add(decisionsBearerPrefix.ReplaceAllString(value, ""), credential)
 	}
 	if _, query, ok := strings.Cut(target, "?"); ok {
-		for _, value := range decisionsQueryValues(query) {
-			add(value)
+		for _, pair := range strings.Split(query, "&") {
+			_, encoded, _ := strings.Cut(pair, "=")
+			value := lenientPercentDecode(strings.ReplaceAll(encoded, "+", " "))
+			if utf8.RuneCountInString(trimHTTPWhitespace(value)) >= decisionsMinSecretRunes {
+				add(value, false)
+				add(encoded, false)
+			}
 		}
 	}
 
@@ -671,19 +947,6 @@ func utf16Len(s string) int {
 		n += utf16.RuneLen(r)
 	}
 	return n
-}
-
-// decisionsQueryValues parses query values like WHATWG URLSearchParams.
-func decisionsQueryValues(query string) []string {
-	var values []string
-	for _, pair := range strings.Split(query, "&") {
-		if pair == "" {
-			continue
-		}
-		_, value, _ := strings.Cut(pair, "=")
-		values = append(values, lenientPercentDecode(strings.ReplaceAll(value, "+", " ")))
-	}
-	return values
 }
 
 func lenientPercentDecode(s string) string {
@@ -791,50 +1054,116 @@ func maxSecretBytes(secrets []string) int {
 	return longest
 }
 
-func decisionsVariantPattern(variant string) string {
-	hexClass := func(digits string) string {
-		var b strings.Builder
-		for i := 0; i < len(digits); i++ {
-			c := digits[i]
-			if lower := c | 0x20; 'a' <= lower && lower <= 'f' {
-				b.WriteString("[" + string(lower) + string(lower-('a'-'A')) + "]")
-			} else {
-				b.WriteByte(c)
+// Folding only escape hex digits preserves byte offsets and ordinary character case.
+func foldDecisionsEscapes(text string) (string, []int) {
+	folded := []byte(text)
+	var positions []int
+	for i := 0; i < len(folded); i++ {
+		start, end := 0, 0
+		if folded[i] == '%' && i+3 <= len(folded) {
+			start, end = i+1, i+3
+		} else if folded[i] == '\\' && i+6 <= len(folded) && folded[i+1] == 'u' {
+			start, end = i+2, i+6
+		} else {
+			continue
+		}
+		valid := true
+		for _, c := range folded[start:end] {
+			valid = valid && isHex(c)
+		}
+		if valid {
+			for j := start; j < end; j++ {
+				if folded[j] >= 'A' && folded[j] <= 'F' {
+					folded[j] += 'a' - 'A'
+				}
+				if folded[j] >= 'a' && folded[j] <= 'f' {
+					positions = append(positions, j)
+				}
 			}
-		}
-		return b.String()
-	}
-	allHex := func(s string) bool {
-		for i := 0; i < len(s); i++ {
-			if !isHex(s[i]) {
-				return false
-			}
-		}
-		return true
-	}
-	var out strings.Builder
-	for i := 0; i < len(variant); {
-		switch {
-		case strings.HasPrefix(variant[i:], `\u`) && i+6 <= len(variant) && allHex(variant[i+2:i+6]):
-			out.WriteString(`\\u` + hexClass(variant[i+2:i+6]))
-			i += 6
-		case variant[i] == '%' && i+3 <= len(variant) && allHex(variant[i+1:i+3]):
-			out.WriteString("%" + hexClass(variant[i+1:i+3]))
-			i += 3
-		default:
-			_, size := utf8.DecodeRuneInString(variant[i:])
-			out.WriteString(regexp.QuoteMeta(variant[i : i+size]))
-			i += size
+			i = end - 1
 		}
 	}
-	return out.String()
+	return string(folded), positions
+}
+
+func matchesDecisionsVariant(text, folded string, positions []int) bool {
+	cursor := 0
+	for _, p := range positions {
+		if text[cursor:p] != folded[cursor:p] || text[p]|0x20 != folded[p] {
+			return false
+		}
+		cursor = p + 1
+	}
+	return text[cursor:] == folded[cursor:]
 }
 
 func redactDecisionsText(text string, secrets []string) string {
-	for _, secret := range secrets {
-		text = regexp.MustCompile(decisionsVariantPattern(secret)).ReplaceAllLiteralString(text, decisionsRedacted)
+	limit := min(len(text), decisionsMaxErrorBodyBytes)
+	retainedLimit := limit
+	window := min(len(text), decisionsMaxErrorBodyBytes+maxSecretBytes(secrets)+1)
+	if !utf8.ValidString(text[:window]) {
+		prefix := truncateUTF8(text, limit)
+		retainedLimit = len(decodeDecisionsUTF8([]byte(prefix)))
+		matchLimit := retainedLimit
+		if len(prefix) < limit {
+			// A crossing character can begin a secret, but cannot be retained literally.
+			matchLimit++
+		}
+		text = decodeDecisionsUTF8([]byte(text[:window]))
+		limit, window = matchLimit, len(text)
 	}
-	return text
+	type interval struct{ start, end int }
+	var matches []interval
+	seen := make(map[string]bool, len(secrets))
+	for _, secret := range secrets {
+		folded, positions := foldDecisionsEscapes(secret)
+		if secret == "" || seen[folded] {
+			continue
+		}
+		seen[folded] = true
+		prefix := secret
+		if len(positions) > 0 {
+			prefix = secret[:positions[0]]
+		}
+		for offset := 0; offset < limit; {
+			index := strings.Index(text[offset:window], prefix)
+			if index < 0 || offset+index >= limit {
+				break
+			}
+			start := offset + index
+			end := start + len(secret)
+			if end <= window && matchesDecisionsVariant(text[start:end], folded, positions) {
+				matches = append(matches, interval{start, end})
+			}
+			offset = start + 1 // Include self-overlapping matches against the original text.
+		}
+	}
+	sort.Slice(matches, func(i, j int) bool {
+		if matches[i].start != matches[j].start {
+			return matches[i].start < matches[j].start
+		}
+		return matches[i].end > matches[j].end
+	})
+	merged := matches[:0]
+	for _, match := range matches {
+		if n := len(merged); n > 0 && match.start < merged[n-1].end {
+			merged[n-1].end = max(merged[n-1].end, match.end)
+		} else {
+			merged = append(merged, match)
+		}
+	}
+	var out strings.Builder
+	cursor := 0
+	for _, match := range merged {
+		out.WriteString(text[cursor:match.start])
+		out.WriteString(decisionsRedacted)
+		cursor = match.end
+	}
+	if cursor < retainedLimit {
+		// Lookahead identifies crossing credentials but must never become retained text.
+		out.WriteString(truncateUTF8(text[cursor:], retainedLimit-cursor))
+	}
+	return truncateUTF8(decodeDecisionsLossy([]byte(out.String())), decisionsMaxErrorBodyBytes)
 }
 
 // ============================================================================
@@ -844,7 +1173,10 @@ func redactDecisionsText(text string, secrets []string) string {
 // decodeDecisionsLossy decodes UTF-8 like the WHATWG TextDecoder: a leading BOM is removed
 // and each maximal invalid subsequence becomes U+FFFD.
 func decodeDecisionsLossy(data []byte) string {
-	data = bytes.TrimPrefix(data, []byte("\xEF\xBB\xBF"))
+	return decodeDecisionsUTF8(bytes.TrimPrefix(data, []byte("\xEF\xBB\xBF")))
+}
+
+func decodeDecisionsUTF8(data []byte) string {
 	if utf8.Valid(data) {
 		return string(data)
 	}
@@ -941,24 +1273,71 @@ func isJSONNull(raw json.RawMessage) bool {
 func (o decisionsObject) num(key string) (float64, error) {
 	raw := bytes.TrimSpace(o[key])
 	var value float64
-	if len(raw) == 0 || (raw[0] != '-' && (raw[0] < '0' || raw[0] > '9')) || json.Unmarshal(raw, &value) != nil {
+	if len(raw) == 0 || (raw[0] != '-' && (raw[0] < '0' || raw[0] > '9')) || json.Unmarshal(raw, &value) != nil || math.IsNaN(value) || math.IsInf(value, 0) {
 		return 0, decisionsParseError(fmt.Sprintf("Expected number '%s'.", key))
 	}
 	return value, nil
 }
 
 func (o decisionsObject) optionalCount(key string) (int64, error) {
-	if o == nil || isJSONNull(o[key]) {
+	if o[key] == nil {
 		return 0, nil
 	}
-	value, err := o.num(key)
-	if err != nil {
-		return 0, err
+	return o.integer(key)
+}
+
+func (o decisionsObject) integer(key string) (int64, error) {
+	raw := strings.TrimSpace(string(o[key]))
+	fail := decisionsParseError(fmt.Sprintf("Expected signed integer '%s'.", key))
+	if raw == "" || (raw[0] != '-' && (raw[0] < '0' || raw[0] > '9')) {
+		return 0, fail
 	}
-	if value != math.Trunc(value) || math.Abs(value) > 1<<53 {
-		return 0, decisionsParseError(fmt.Sprintf("Expected integer '%s'.", key))
+	if !strings.ContainsAny(raw, ".eE") {
+		value, err := strconv.ParseInt(raw, 10, 64)
+		if err != nil {
+			return 0, fail
+		}
+		return value, nil
 	}
-	return int64(value), nil
+	negative := strings.HasPrefix(raw, "-")
+	mantissa := strings.TrimPrefix(raw, "-")
+	exponentText := ""
+	if i := strings.IndexAny(mantissa, "eE"); i >= 0 {
+		mantissa, exponentText = mantissa[:i], mantissa[i+1:]
+	}
+	whole, fraction, _ := strings.Cut(mantissa, ".")
+	digits := strings.TrimLeft(whole+fraction, "0")
+	if digits == "" {
+		return 0, nil
+	}
+	var exponent int64
+	if exponentText != "" {
+		var err error
+		exponent, err = strconv.ParseInt(exponentText, 10, 64)
+		if err != nil || exponent > int64(len(raw))+20 || exponent < -int64(len(raw))-20 {
+			return 0, fail
+		}
+	}
+	shift := exponent - int64(len(fraction))
+	if shift < 0 {
+		if -shift >= int64(len(digits)) || strings.Trim(digits[int64(len(digits))+shift:], "0") != "" {
+			return 0, fail
+		}
+		digits = digits[:int64(len(digits))+shift]
+	} else {
+		if int64(len(digits))+shift > 16 {
+			return 0, fail
+		}
+		digits += strings.Repeat("0", int(shift))
+	}
+	value, err := strconv.ParseInt(digits, 10, 64)
+	if err != nil || value > decisionsMaxSafeInteger {
+		return 0, fail
+	}
+	if negative {
+		value = -value
+	}
+	return value, nil
 }
 
 func (o decisionsObject) str(key string) (string, error) {
@@ -1064,12 +1443,9 @@ func parseDecisionsAnswer(obj decisionsObject, raw json.RawMessage) (DecisionsAn
 		}
 		probabilities := make([]DecisionsScoreProbability, 0, len(entries))
 		for _, entry := range entries {
-			value, err := entry.num("value")
+			value, err := entry.integer("value")
 			if err != nil {
 				return nil, err
-			}
-			if value != math.Trunc(value) || math.Abs(value) > math.MaxInt32 {
-				return nil, decisionsParseError("Expected integer level 'value'.")
 			}
 			label, err := entry.str("label")
 			if err != nil {
@@ -1079,7 +1455,7 @@ func parseDecisionsAnswer(obj decisionsObject, raw json.RawMessage) (DecisionsAn
 			if err != nil {
 				return nil, err
 			}
-			probabilities = append(probabilities, DecisionsScoreProbability{Label: label, Value: int(value), Probability: probability})
+			probabilities = append(probabilities, DecisionsScoreProbability{Label: label, Value: value, Probability: probability})
 		}
 		return DecisionsScoreAnswer{Name: name, Score: score, Confidence: confidence, Probabilities: probabilities}, nil
 	case "refusal":
@@ -1090,6 +1466,7 @@ func parseDecisionsAnswer(obj decisionsObject, raw json.RawMessage) (DecisionsAn
 }
 
 func parseDecisionsResult(data []byte) (*DecisionsResult, error) {
+	data = bytes.TrimPrefix(data, []byte("\xEF\xBB\xBF"))
 	result, err := parseDecisionsResultInner(data)
 	if err != nil {
 		var parseErr decisionsParseError

@@ -17,12 +17,14 @@ import com.github.copilot.CopilotExperimental;
 @CopilotExperimental
 public final class DecisionsOptions {
 
+    static final Duration DEFAULT_TIMEOUT = Duration.ofSeconds(600);
+
     private String endpointModelId;
     private HttpClient httpClient;
-    private Duration timeout;
+    private Duration timeout = DEFAULT_TIMEOUT;
 
     /**
-     * Creates empty options.
+     * Creates options with the default 600-second total-call timeout.
      */
     public DecisionsOptions() {
     }
@@ -65,7 +67,8 @@ public final class DecisionsOptions {
      * could forward credentials to another origin. A client with any other redirect
      * policy is rejected with {@link IllegalArgumentException}, reported through
      * the returned future, before the request is sent. When {@code null}, a shared
-     * SDK client is used.
+     * SDK client is used. An injected client remains responsible for its TLS policy
+     * and for honoring its reported redirect policy.
      *
      * @param httpClient
      *            the client
@@ -77,32 +80,34 @@ public final class DecisionsOptions {
     }
 
     /**
-     * Returns the per-attempt timeout.
+     * Returns the total-call timeout, including endpoint resolution, response
+     * bodies, and the optional authentication replay.
      *
-     * @return the timeout, or {@code null}
+     * @return the timeout; {@link Duration#ZERO} disables the SDK deadline
      */
     public Duration getTimeout() {
         return timeout;
     }
 
     /**
-     * Sets the per-attempt timeout until response headers arrive
-     * ({@link java.net.http.HttpRequest.Builder#timeout}). A timeout is reported as
-     * a {@link DecisionsErrorKind#NETWORK} error. To bound the whole call, use
-     * {@link java.util.concurrent.CompletableFuture#orTimeout} or cancel the
-     * returned future.
+     * Sets the total-call timeout. Expiry is reported as
+     * {@link DecisionsErrorKind#TIMEOUT}, cancels in-flight HTTP work, and closes
+     * acquired response bodies. The deadline is not reset for authentication
+     * replay. Caller cancellation remains a native
+     * {@link java.util.concurrent.CancellationException}.
      *
      * @param timeout
-     *            a positive timeout, or {@code null} for none
+     *            a positive timeout, {@link Duration#ZERO} to disable it, or
+     *            {@code null} to restore the 600-second default
      * @return these options
      * @throws IllegalArgumentException
-     *             if the timeout is zero or negative
+     *             if the timeout is negative
      */
     public DecisionsOptions setTimeout(Duration timeout) {
-        if (timeout != null && (timeout.isZero() || timeout.isNegative())) {
-            throw new IllegalArgumentException("timeout must be positive.");
+        if (timeout != null && timeout.isNegative()) {
+            throw new IllegalArgumentException("timeout must not be negative.");
         }
-        this.timeout = timeout;
+        this.timeout = timeout == null ? DEFAULT_TIMEOUT : timeout;
         return this;
     }
 }

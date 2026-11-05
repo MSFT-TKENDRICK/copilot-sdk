@@ -1912,6 +1912,40 @@ When `on_elicitation_request` is provided, the SDK automatically:
 - Dispatches `elicitation.requested` events to your handler
 - Auto-cancels if your handler throws an error (so the server doesn't hang)
 
+## Decisions (experimental)
+
+`session.decisions.create(request)` directly calls the session's OpenAI-compatible
+provider, without an agent turn or session history. The runtime must enable
+`COPILOT_ALLOW_GET_PROVIDER_ENDPOINT=true`. The request's `model` is required;
+`endpoint_model_id` is an independent optional endpoint-selection hint.
+
+- `timeout` is a **total-call** deadline, defaulting to `600.0` seconds, including
+  endpoint lookup, HTTP bodies, and the single possible authentication replay.
+  Set `timeout=None` to disable it. Other values must be finite and positive.
+  SDK expiry raises `DecisionsError(kind="timeout")`; caller cancellation and
+  caller-owned deadlines retain their native asyncio behavior.
+- A fully processed 401/403 permits one replay only when the effective URL or
+  credentials changed. Unreadable authentication bodies do not trigger refresh.
+  `DecisionsError.retry_after_ms` is advisory HTTP retry guidance, not an automatic retry.
+- Error bodies retain only the original first 64 KiB of UTF-8, with credential
+  redaction and a final 64-KiB output cap. `body_truncated` reports original-body
+  overflow, not redaction expansion. Known credentials, even short ones, and supported
+  literal/escaped/URL-encoded variants are protected in retained provider diagnostics.
+  Other header/query candidates use an eight-Unicode-scalar heuristic, retaining both
+  raw and decoded query forms. Replay diagnostics protect credentials from both attempts.
+  This is not PII removal or a guarantee against arbitrary transformations or
+  traceback-local capture.
+- Question instructions accept text/image/JSON parts without cache breakpoints.
+  Message content must respect each role's supported part types; unknown input wire types
+  require `{"raw": ...}`. The only documented prompt-cache TTL is `"30m"`.
+- Endpoint URLs must be ASCII HTTP(S) URIs with explicit authority, without userinfo,
+  raw whitespace, controls, backslashes, or malformed percent escapes. Encode Unicode
+  URI components with percent encoding or IDNA first. Built-in HTTP never follows
+  redirects. An injected `http_client` remains caller-owned and trusted for its
+  transport's redirect/TLS behavior; its independent timeouts are network failures.
+
+See the [Decisions API guide](../docs/features/decisions.md) for request examples.
+
 ## Development
 
 Install [uv](https://docs.astral.sh/uv/) and a supported [Node.js version](../nodejs/README.md#prerequisites), then from the repository root:

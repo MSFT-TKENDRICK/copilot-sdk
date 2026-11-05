@@ -18,13 +18,19 @@
 //!   call. On an HTTP 401 or 403 response it is called once more; the request is
 //!   retried a single time only when the effective URL or credentials changed.
 //!   A retried request may be billed twice by the provider.
-//! - Redirects are never followed. A 3xx response is reported as a
+//! - The built-in client never follows redirects. A 3xx response is reported as a
 //!   [`DecisionsErrorKind::Http`](crate::decisions::DecisionsErrorKind::Http) error.
+//!   Injected clients are trusted to enforce their own redirect and TLS policy.
 //! - Requests are sent directly to the provider; they are not routed through a
 //!   [`CopilotRequestHandler`](crate::copilot_request_handler::CopilotRequestHandler).
-//! - Error messages, bodies, and error sources never contain the endpoint's
-//!   credentials: every known secret is redacted before it is surfaced.
+//! - Known endpoint credentials of every nonempty length are redacted from
+//!   retained diagnostics, including common JSON and URL encodings. Other
+//!   header and query values use an eight-Unicode-scalar heuristic. This is
+//!   not general PII removal or protection against arbitrary transformations.
 //! - Error bodies are capped at 64 KiB and success bodies at 8 MiB.
+//! - The default 600-second deadline covers the entire call, including endpoint
+//!   resolution, refresh, both HTTP attempts, and body reads. Override or disable
+//!   it with [`SessionDecisions::create_with_timeout`].
 //!
 //! # Cancellation
 //!
@@ -43,6 +49,7 @@
 
 use std::fmt;
 use std::future::Future;
+use std::time::Duration;
 
 use bytes::Bytes;
 use futures_util::future::BoxFuture;
@@ -57,6 +64,8 @@ use crate::rpc::{
 use crate::session::Session;
 use crate::{Error, ErrorKind};
 
+mod retry_after;
+#[cfg(test)]
 mod tests;
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
@@ -66,6 +75,8 @@ const MAX_ERROR_BODY_BYTES: usize = 64 * 1024;
 const MAX_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
 const MIN_SECRET_LENGTH: usize = 8;
 const REDACTED: &str = "[REDACTED]";
+const DEFAULT_TIMEOUT: Duration = Duration::from_secs(600);
+const MAX_SAFE_INTEGER: i64 = 9_007_199_254_740_991;
 
 // ============================================================================
 // Request types
@@ -445,7 +456,7 @@ pub enum DecisionsQuestionPart {
     Text(DecisionsQuestionText),
     /// `input_image`
     Image(DecisionsQuestionImage),
-    /// `input_json`
+    /// `input_json` (no cache breakpoint).
     Json(DecisionsInputJson),
 }
 
@@ -624,7 +635,7 @@ pub struct DecisionsOptions {
     /// [`DecisionsRequest::model`].
     pub endpoint_model_id: Option<String>,
     /// Custom HTTP client (proxying, custom TLS). Injected clients are trusted
-    /// and must provide their own redirect protection: build them with
+    /// to enforce their own TLS and redirect policy: build them with
     /// [`reqwest::redirect::Policy::none`]. `None` uses a shared client that
     /// never follows redirects.
     pub http_client: Option<reqwest::Client>,
@@ -736,31 +747,32 @@ impl DecisionsAnswer {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct DecisionsInputTokensDetails {
     /// Tokens served from the prompt cache.
-    pub cached_tokens: u64,
+    pub cached_tokens: i64,
     /// Tokens written to the prompt cache.
-    pub cache_write_tokens: u64,
+    pub cache_write_tokens: i64,
 }
 
 /// **Experimental.** Output token details.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct DecisionsOutputTokensDetails {
     /// Reasoning tokens.
-    pub reasoning_tokens: u64,
+    pub reasoning_tokens: i64,
 }
 
 /// **Experimental.** Token usage. Missing counts are reported as `0`.
+/// Signed provider values, including negative sentinels, are preserved.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct DecisionsUsage {
     /// Input tokens.
-    pub input_tokens: u64,
+    pub input_tokens: i64,
     /// Input token details.
     pub input_tokens_details: DecisionsInputTokensDetails,
     /// Output tokens.
-    pub output_tokens: u64,
+    pub output_tokens: i64,
     /// Output token details.
     pub output_tokens_details: DecisionsOutputTokensDetails,
     /// Total tokens.
-    pub total_tokens: u64,
+    pub total_tokens: i64,
 }
 
 /// **Experimental.** A Decisions API result.
@@ -800,6 +812,9 @@ pub enum DecisionsErrorKind {
     InvalidResponse,
     /// The request could not be sent or the response could not be read.
     Network,
+    /// The SDK-owned total-call deadline expired. Dropping the caller's future
+    /// remains native cancellation; an injected client's timeout is `Network`.
+    Timeout,
 }
 
 impl DecisionsErrorKind {
@@ -815,6 +830,7 @@ impl DecisionsErrorKind {
             Self::Http => "http",
             Self::InvalidResponse => "invalidResponse",
             Self::Network => "network",
+            Self::Timeout => "timeout",
         }
     }
 }
@@ -825,8 +841,8 @@ impl fmt::Display for DecisionsErrorKind {
     }
 }
 
-/// **Experimental.** Details of a failed Decisions call. Messages, bodies, and
-/// sources never contain credentials.
+/// **Experimental.** Details of a failed Decisions call. Retained diagnostics
+/// are bounded and redact known credentials and their supported encodings.
 ///
 /// Obtain it from an [`Error`] with [`Error::decisions_error`].
 #[derive(Debug)]
@@ -845,6 +861,7 @@ struct HttpDetails {
     error_code: Option<String>,
     error_param: Option<String>,
     request_id: Option<String>,
+    retry_after_ms: Option<u64>,
     body: String,
     body_truncated: bool,
 }
@@ -894,9 +911,16 @@ impl DecisionsError {
         self.http.as_ref()?.error_param.as_deref()
     }
 
-    /// **Experimental.** Value of the `x-request-id` response header.
+    /// **Experimental.** Bounded, redacted `x-request-id` response header.
     pub fn request_id(&self) -> Option<&str> {
         self.http.as_ref()?.request_id.as_deref()
+    }
+
+    /// **Experimental.** Advisory provider retry delay in milliseconds for an
+    /// HTTP error. Prefers valid `retry-after-ms` over `Retry-After`; never
+    /// triggers automatic retries. Invalid or overflowing hints are absent.
+    pub fn retry_after_ms(&self) -> Option<u64> {
+        self.http.as_ref()?.retry_after_ms
     }
 
     /// **Experimental.** Response body (at most 64 KiB, credentials redacted).
@@ -904,7 +928,8 @@ impl DecisionsError {
         self.http.as_ref().map(|h| h.body.as_str())
     }
 
-    /// **Experimental.** Whether [`body`](Self::body) was truncated at 64 KiB.
+    /// **Experimental.** Whether the original body exceeded 64 KiB. Redaction
+    /// expansion can reach the output cap without setting this flag.
     pub fn body_truncated(&self) -> Option<bool> {
         self.http.as_ref().map(|h| h.body_truncated)
     }
@@ -930,10 +955,11 @@ impl From<DecisionsError> for Error {
     }
 }
 
-/// **Experimental.** Credential-free stand-in for a transport error, used as
+/// **Experimental.** Sanitized stand-in for a transport error, used as
 /// the source of [`DecisionsErrorKind::Network`] errors. Only a category name,
 /// an optional I/O error code, and the redacted message are retained, so
-/// request URLs and headers cannot leak.
+/// arbitrary exception objects, URL/header attributes, and source chains are
+/// not retained. Only known credentials and supported encodings are redacted.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DecisionsErrorCause {
     name: String,
@@ -1004,28 +1030,32 @@ fn error_name(error: &(dyn std::error::Error + 'static)) -> &'static str {
 
 fn sanitize_cause(error: &BoxError, redactor: &Redactor) -> DecisionsErrorCause {
     let top: &(dyn std::error::Error + 'static) = &**error;
-    let mut message = top.to_string();
+    let limit = MAX_ERROR_BODY_BYTES.saturating_add(redactor.max_secret_bytes);
+    let mut message = truncate_utf8(top.to_string(), limit);
     let mut code = None;
     let mut current = Some(top);
-    while let Some(e) = current {
+    // A custom transport may supply a cyclic or arbitrarily deep error chain.
+    for _ in 0..16 {
+        let Some(e) = current else { break };
         if code.is_none()
             && let Some(io) = e.downcast_ref::<std::io::Error>()
         {
             code = Some(format!("{:?}", io.kind()));
         }
-        if !std::ptr::addr_eq(e, top) {
+        if !std::ptr::addr_eq(e, top) && message.len() < limit {
             let text = e.to_string();
             if !text.is_empty() && !message.contains(&text) {
                 message.push_str(": ");
                 message.push_str(&text);
+                message = truncate_utf8(message, limit);
             }
         }
         current = e.source();
     }
     DecisionsErrorCause {
-        name: error_name(top).to_owned(),
+        name: redactor.redact(error_name(top)),
         message: redactor.redact(&message),
-        code,
+        code: code.map(|code| redactor.redact(&code)),
     }
 }
 
@@ -1034,15 +1064,13 @@ fn network_error(message: &str, error: &BoxError, redactor: &Redactor) -> Decisi
         .with_source(sanitize_cause(error, redactor))
 }
 
-fn endpoint_unavailable(cause: Error) -> DecisionsError {
-    let message = if cause.to_string().contains(GATE_ENV) {
+fn endpoint_unavailable(_cause: Error) -> DecisionsError {
+    decisions_error(
+        DecisionsErrorKind::EndpointUnavailable,
         format!(
-            "session.decisions requires the runtime's provider endpoint API. Set {GATE_ENV}=true in the runtime's environment (for in-process runtimes, in the host process environment before the runtime is loaded)."
-        )
-    } else {
-        "Could not resolve the session's provider endpoint for the Decisions API.".to_owned()
-    };
-    decisions_error(DecisionsErrorKind::EndpointUnavailable, message).with_source(cause)
+            "Could not resolve the session's provider endpoint for the Decisions API. Ensure the runtime supports this API and {GATE_ENV}=true is set in the runtime's environment (or in the host environment before an in-process runtime is loaded)."
+        ),
+    )
 }
 
 // ============================================================================
@@ -1061,60 +1089,82 @@ fn is_token_byte(b: u8) -> bool {
     b.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&b)
 }
 
-fn type_name(t: &ProviderEndpointType) -> &'static str {
-    match t {
-        ProviderEndpointType::Openai => "openai",
-        ProviderEndpointType::Azure => "azure",
-        ProviderEndpointType::Anthropic => "anthropic",
-        ProviderEndpointType::Unknown => "unknown",
-    }
-}
-
-fn transport_name(t: &ProviderEndpointTransport) -> &'static str {
-    match t {
-        ProviderEndpointTransport::Http => "http",
-        ProviderEndpointTransport::Websockets => "websockets",
-        ProviderEndpointTransport::Unknown => "unknown",
-    }
-}
-
-/// Whether the raw authority of `base_url` contains `@`; the url crate drops empty userinfo.
-fn raw_authority_has_userinfo(base_url: &str) -> bool {
-    let trimmed = base_url.trim();
-    let after_scheme = match trimmed.find(':') {
-        Some(i) => trimmed[i + 1..].trim_start_matches(['/', '\\']),
-        None => trimmed,
-    };
-    after_scheme
-        .split(['/', '\\', '?', '#'])
-        .next()
-        .unwrap_or_default()
-        .contains('@')
-}
-
 /// Builds the Decisions URL from the endpoint's base URL.
 fn build_url(
     endpoint_type: &ProviderEndpointType,
     base_url: &str,
 ) -> Result<String, DecisionsError> {
+    let malformed = || invalid_endpoint("The provider endpoint base URL is not a valid HTTP URL.");
+    if base_url
+        .bytes()
+        .any(|b| !b.is_ascii() || b <= b' ' || b == 0x7f || b == b'\\')
+    {
+        return Err(malformed());
+    }
+    let Some((scheme, rest)) = base_url.split_once("://") else {
+        return Err(malformed());
+    };
+    if !scheme.eq_ignore_ascii_case("http") && !scheme.eq_ignore_ascii_case("https") {
+        return Err(malformed());
+    }
+    let bytes = base_url.as_bytes();
+    for (i, &b) in bytes.iter().enumerate() {
+        if b == b'%'
+            && !bytes
+                .get(i + 1..i + 3)
+                .is_some_and(|digits| digits.iter().all(u8::is_ascii_hexdigit))
+        {
+            return Err(malformed());
+        }
+    }
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
+    if authority.is_empty() || authority.contains('@') {
+        return Err(malformed());
+    }
+    let port = if authority.starts_with('[') {
+        let Some((_, tail)) = authority.split_once(']') else {
+            return Err(malformed());
+        };
+        if tail.is_empty() {
+            None
+        } else {
+            Some(tail.strip_prefix(':').ok_or_else(malformed)?)
+        }
+    } else {
+        authority.split_once(':').map(|(_, port)| port)
+    };
+    if let Some(port) = port
+        && (port.is_empty()
+            || !port.bytes().all(|b| b.is_ascii_digit())
+            || port.parse::<u16>().is_err())
+    {
+        return Err(malformed());
+    }
     let url = reqwest::Url::parse(base_url).map_err(|_| {
         invalid_endpoint("The provider endpoint base URL is not a valid absolute URL.")
     })?;
     let scheme = url.scheme();
-    if scheme != "http" && scheme != "https" {
-        return Err(invalid_endpoint(
-            "The provider endpoint base URL must use http or https.",
-        ));
-    }
-    if !url.username().is_empty()
-        || url.password().is_some_and(|p| !p.is_empty())
-        || raw_authority_has_userinfo(base_url)
+    let host = url
+        .host_str()
+        .filter(|host| !host.is_empty())
+        .ok_or_else(malformed)?;
+    if !host.starts_with('[')
+        && host
+            .strip_suffix('.')
+            .unwrap_or(host)
+            .split('.')
+            .any(|label| {
+                label.is_empty()
+                    || label.len() > 63
+                    || label.starts_with('-')
+                    || label.ends_with('-')
+                    || !label
+                        .bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+            })
     {
-        return Err(invalid_endpoint(
-            "The provider endpoint base URL must not contain credentials.",
-        ));
+        return Err(malformed());
     }
-    let host = url.host_str().unwrap_or_default();
     let port = url.port().map(|p| format!(":{p}")).unwrap_or_default();
     let base_path = url.path().trim_end_matches('/');
     let suffix = if *endpoint_type == ProviderEndpointType::Azure
@@ -1151,6 +1201,9 @@ fn check_header<'v>(name: &str, value: &'v str) -> Result<&'v str, DecisionsErro
 /// Merges endpoint headers and credentials into the outbound header set
 /// (lowercase names).
 fn build_headers(endpoint: &ProviderEndpoint) -> Result<IndexMap<String, String>, DecisionsError> {
+    if let Some(api_key) = endpoint.api_key.as_deref() {
+        check_header("api-key", api_key)?;
+    }
     let mut merged: IndexMap<String, String> = IndexMap::new();
     for (name, raw_value) in &endpoint.headers {
         let value = check_header(name, raw_value)?;
@@ -1227,10 +1280,7 @@ fn plan_attempt(endpoint: &ProviderEndpoint, model: &str) -> Result<AttemptPlan,
     ) {
         return Err(decisions_error(
             DecisionsErrorKind::UnsupportedProvider,
-            format!(
-                "The session's provider type '{}' does not support the Decisions API.",
-                type_name(&endpoint.r#type)
-            ),
+            "The session's provider type does not support the Decisions API.",
         ));
     }
     if let Some(transport) = &endpoint.transport
@@ -1238,10 +1288,7 @@ fn plan_attempt(endpoint: &ProviderEndpoint, model: &str) -> Result<AttemptPlan,
     {
         return Err(decisions_error(
             DecisionsErrorKind::UnsupportedTransport,
-            format!(
-                "The session's provider transport '{}' is not supported by the Decisions API.",
-                transport_name(transport)
-            ),
+            "The session's provider transport is not supported by the Decisions API.",
         ));
     }
     if let Some(token_model) = endpoint
@@ -1252,9 +1299,7 @@ fn plan_attempt(endpoint: &ProviderEndpoint, model: &str) -> Result<AttemptPlan,
     {
         return Err(decisions_error(
             DecisionsErrorKind::ModelMismatch,
-            format!(
-                "The provider session token is bound to model '{token_model}', but the request uses '{model}'. Set endpoint_model_id or request.model consistently."
-            ),
+            "The provider session token is bound to a different model. Set endpoint_model_id or request.model consistently.",
         ));
     }
     let url = build_url(&endpoint.r#type, &endpoint.base_url)?;
@@ -1295,32 +1340,50 @@ fn strip_bearer(value: &str) -> Option<&str> {
     (stripped.len() < after.len()).then_some(stripped)
 }
 
-/// Credentials that must never surface in errors: the API key, the session
-/// token, every endpoint header value (also without a `Bearer` scheme), and
-/// URL query values. Each is trimmed of SP/HTAB, kept only if at least
-/// [`MIN_SECRET_LENGTH`] Unicode scalar values long, then expanded into its
-/// wire encodings. Sorted longest first.
+/// Every nonempty actual credential is protected; only other header/query
+/// values use the Unicode-scalar minimum. Expand SP/HTAB-trimmed candidates
+/// into supported wire encodings.
 fn collect_secrets(endpoint: &ProviderEndpoint, url: &str) -> Vec<String> {
     let mut raw: IndexMap<String, ()> = IndexMap::new();
-    let mut add = |value: &str| {
+    let mut add = |value: &str, credential: bool| {
         let trimmed = trim_http_whitespace(value);
-        if trimmed.chars().count() >= MIN_SECRET_LENGTH {
+        if !trimmed.is_empty() && (credential || trimmed.chars().count() >= MIN_SECRET_LENGTH) {
             raw.insert(trimmed.to_owned(), ());
         }
     };
     if let Some(api_key) = endpoint.api_key.as_deref() {
-        add(api_key);
+        add(api_key, true);
     }
     if let Some(token) = &endpoint.session_token {
-        add(&token.token);
+        add(&token.token, true);
+        if token.header.eq_ignore_ascii_case("authorization")
+            && let Some(bearer) = strip_bearer(&token.token)
+        {
+            add(bearer, true);
+        }
     }
-    for value in endpoint.headers.values() {
-        add(value);
-        add(strip_bearer(value).unwrap_or(value));
+    for (name, value) in &endpoint.headers {
+        let credential = name.eq_ignore_ascii_case("authorization")
+            || name.eq_ignore_ascii_case("api-key")
+            || endpoint
+                .session_token
+                .as_ref()
+                .is_some_and(|token| token.header.eq_ignore_ascii_case(name));
+        add(value, credential);
+        add(strip_bearer(value).unwrap_or(value), credential);
     }
     if let Ok(parsed) = reqwest::Url::parse(url) {
-        for (_, value) in parsed.query_pairs() {
-            add(&value);
+        let raw_pairs = parsed
+            .query()
+            .unwrap_or("")
+            .split('&')
+            .filter(|pair| !pair.is_empty());
+        for (raw_pair, (_, value)) in raw_pairs.zip(parsed.query_pairs()) {
+            add(&value, false);
+            if trim_http_whitespace(&value).chars().count() >= MIN_SECRET_LENGTH {
+                let raw_value = raw_pair.split_once('=').map_or("", |(_, value)| value);
+                add(raw_value, false);
+            }
         }
     }
     let mut variants: IndexMap<String, ()> = IndexMap::new();
@@ -1330,7 +1393,7 @@ fn collect_secrets(endpoint: &ProviderEndpoint, url: &str) -> Vec<String> {
         }
     }
     let mut out: Vec<String> = variants.into_keys().collect();
-    out.sort_by_key(|v| std::cmp::Reverse(v.encode_utf16().count()));
+    out.sort_by_key(|v| std::cmp::Reverse(v.len()));
     out
 }
 
@@ -1438,6 +1501,7 @@ impl Redactor {
         let max_secret_bytes = secrets.iter().map(String::len).max().unwrap_or(0);
         let patterns = secrets
             .into_iter()
+            .filter(|secret| !secret.is_empty())
             .map(|secret| {
                 let regex = regex::RegexBuilder::new(&variant_pattern(&secret))
                     .size_limit(1 << 26)
@@ -1452,17 +1516,103 @@ impl Redactor {
         }
     }
 
-    /// Replaces every occurrence of any secret variant with `[REDACTED]`, longest first.
-    fn redact(&self, text: &str) -> String {
-        let mut result = text.to_owned();
-        for (secret, regex) in &self.patterns {
-            result = match regex {
-                Some(regex) => regex.replace_all(&result, REDACTED).into_owned(),
-                None => result.replace(secret.as_str(), REDACTED),
-            };
-        }
-        result
+    fn include(&mut self, previous: Self) {
+        self.max_secret_bytes = self.max_secret_bytes.max(previous.max_secret_bytes);
+        self.patterns.extend(previous.patterns);
     }
+
+    /// Protects the original prefix, using lookahead only to recognize secrets
+    /// crossing its boundary. Replacement never pulls lookahead into output.
+    fn redact(&self, text: &str) -> String {
+        self.redact_prefix(text, char_boundary(text, MAX_ERROR_BODY_BYTES))
+    }
+
+    fn redact_prefix(&self, text: &str, retained_end: usize) -> String {
+        let search_end = char_boundary(text, retained_end.saturating_add(self.max_secret_bytes));
+        let searched = &text[..search_end];
+        let mut intervals = Vec::new();
+        for (secret, regex) in &self.patterns {
+            if let Some(regex) = regex {
+                let mut from = 0;
+                while let Some(found) = regex.find_at(searched, from) {
+                    intervals.push((found.start(), found.end()));
+                    // find_iter skips self-overlapping occurrences.
+                    from = found.start()
+                        + searched[found.start()..].chars().next().unwrap().len_utf8();
+                }
+            } else {
+                // Large patterns may exceed the regex compiler's size limit.
+                // Preserve escape-case semantics even in that fallback.
+                for (start, _) in searched.char_indices() {
+                    let end = start + secret.len();
+                    if let Some(candidate) = searched.as_bytes().get(start..end)
+                        && variant_matches(secret.as_bytes(), candidate)
+                    {
+                        intervals.push((start, end));
+                    }
+                }
+            }
+        }
+        intervals.sort_unstable();
+        let mut unions: Vec<(usize, usize)> = Vec::new();
+        for (start, end) in intervals {
+            if let Some(last) = unions.last_mut()
+                && start < last.1
+            {
+                last.1 = last.1.max(end);
+            } else {
+                unions.push((start, end));
+            }
+        }
+        let mut result = String::new();
+        let mut cursor = 0;
+        for (start, end) in unions {
+            if start >= retained_end {
+                break;
+            }
+            result.push_str(&text[cursor..start]);
+            result.push_str(REDACTED);
+            cursor = end;
+        }
+        if cursor < retained_end {
+            result.push_str(&text[cursor..retained_end]);
+        }
+        truncate_utf8(result, MAX_ERROR_BODY_BYTES)
+    }
+}
+
+fn variant_matches(pattern: &[u8], candidate: &[u8]) -> bool {
+    let mut i = 0;
+    while i < pattern.len() {
+        let hex_len = if pattern[i..].starts_with(b"\\u") {
+            4
+        } else if pattern[i] == b'%' {
+            2
+        } else {
+            0
+        };
+        let prefix_len = if hex_len == 4 { 2 } else { 1 };
+        let end = i + prefix_len + hex_len;
+        if hex_len > 0
+            && pattern
+                .get(i + prefix_len..end)
+                .is_some_and(|hex| hex.iter().all(u8::is_ascii_hexdigit))
+        {
+            if pattern[i..i + prefix_len] != candidate[i..i + prefix_len]
+                || !pattern[i + prefix_len..end]
+                    .eq_ignore_ascii_case(&candidate[i + prefix_len..end])
+            {
+                return false;
+            }
+            i = end;
+        } else {
+            if pattern[i] != candidate[i] {
+                return false;
+            }
+            i += 1;
+        }
+    }
+    true
 }
 
 // ============================================================================
@@ -1484,24 +1634,99 @@ fn num(obj: &Map<String, Value>, key: &str) -> Shape<f64> {
     }
 }
 
-fn token_count(obj: Option<&Map<String, Value>>, key: &str) -> Shape<u64> {
-    let Some(obj) = obj else { return Ok(0) };
-    match obj.get(key) {
-        None | Some(Value::Null) => Ok(0),
+fn integer(value: Option<&Value>, key: &str) -> Shape<i64> {
+    match value {
         Some(Value::Number(n)) => {
-            if let Some(u) = n.as_u64() {
-                return Ok(u);
+            if let Some(i) = n.as_i64() {
+                return Ok(i);
             }
-            match n.as_f64() {
-                Some(f)
-                    if f.is_finite() && f >= 0.0 && f.fract() == 0.0 && f <= u64::MAX as f64 =>
-                {
-                    Ok(f as u64)
-                }
-                _ => shape_err(format!("Expected token count '{key}'.")),
+            let token = n.to_string();
+            if token.contains(['.', 'e', 'E'])
+                && let Some(integer) = decimal_integer(&token)
+            {
+                return Ok(integer);
             }
+            shape_err(format!("Expected signed integer '{key}'."))
         }
-        Some(_) => shape_err(format!("Expected number '{key}'.")),
+        _ => shape_err(format!("Expected signed integer '{key}'.")),
+    }
+}
+
+/// Only mathematically integral decimal/exponent encodings inside the portable
+/// safe range are accepted. Inspect the original token, never a rounded f64.
+fn decimal_integer(token: &str) -> Option<i64> {
+    let negative = token.starts_with('-');
+    let unsigned = token.strip_prefix('-').unwrap_or(token);
+    let (mantissa, exponent) = match unsigned.find(['e', 'E']) {
+        Some(index) => (&unsigned[..index], Some(&unsigned[index + 1..])),
+        None => (unsigned, None),
+    };
+    let digits: Vec<u8> = mantissa.bytes().filter(|b| *b != b'.').collect();
+    let Some(first) = digits.iter().position(|b| *b != b'0') else {
+        return Some(0);
+    };
+    let mut digits = &digits[first..];
+    let fractional = mantissa
+        .split_once('.')
+        .map_or(0, |(_, fraction)| fraction.len());
+    let exponent = match exponent {
+        Some(exponent) => exponent.parse::<i64>().ok()?,
+        None => 0,
+    };
+    let scale = exponent.checked_sub(i64::try_from(fractional).ok()?)?;
+    let zeros = if scale < 0 {
+        let remove = usize::try_from(scale.unsigned_abs()).ok()?;
+        let end = digits.len().checked_sub(remove)?;
+        if !digits[end..].iter().all(|b| *b == b'0') {
+            return None;
+        }
+        digits = &digits[..end];
+        0
+    } else {
+        usize::try_from(scale).ok()?
+    };
+    if digits.len().checked_add(zeros)? > 16 {
+        return None;
+    }
+    let mut magnitude = 0i64;
+    for digit in digits {
+        magnitude = magnitude
+            .checked_mul(10)?
+            .checked_add(i64::from(digit - b'0'))?;
+    }
+    magnitude = magnitude.checked_mul(10i64.checked_pow(u32::try_from(zeros).ok()?)?)?;
+    if magnitude > MAX_SAFE_INTEGER {
+        return None;
+    }
+    Some(if negative { -magnitude } else { magnitude })
+}
+
+fn token_count(obj: Option<&Map<String, Value>>, key: &str) -> Shape<i64> {
+    let value = obj.and_then(|obj| obj.get(key));
+    if value.is_none() {
+        Ok(0)
+    } else {
+        integer(value, key)
+    }
+}
+
+fn probability(obj: &Map<String, Value>, key: &str) -> Shape<f64> {
+    let value = num(obj, key)?;
+    if (0.0..=1.0).contains(&value) {
+        Ok(value)
+    } else {
+        shape_err(format!("Expected probability '{key}' in [0, 1]."))
+    }
+}
+
+fn optional_object<'a>(
+    obj: &'a Map<String, Value>,
+    key: &str,
+) -> Shape<Option<&'a Map<String, Value>>> {
+    match obj.get(key) {
+        None => Ok(None),
+        Some(Value::Object(value)) => Ok(Some(value)),
+        _ => shape_err(format!("Expected object '{key}'.")),
     }
 }
 
@@ -1545,18 +1770,18 @@ fn parse_answer(obj: &Map<String, Value>) -> Shape<DecisionsAnswer> {
     Ok(match wire_type.as_str() {
         "predicate" => DecisionsAnswer::Predicate(DecisionsPredicateAnswer {
             name,
-            probability: num(obj, "probability")?,
+            probability: probability(obj, "probability")?,
         }),
         "choice" => DecisionsAnswer::Choice(DecisionsChoiceAnswer {
             name,
             choice: choice_value(obj, "choice")?,
-            confidence: num(obj, "confidence")?,
+            confidence: probability(obj, "confidence")?,
             probabilities: objects(obj, "probabilities")?
                 .into_iter()
                 .map(|p| {
                     Ok(DecisionsChoiceProbability {
                         value: choice_value(p, "value")?,
-                        probability: num(p, "probability")?,
+                        probability: probability(p, "probability")?,
                     })
                 })
                 .collect::<Shape<_>>()?,
@@ -1564,18 +1789,14 @@ fn parse_answer(obj: &Map<String, Value>) -> Shape<DecisionsAnswer> {
         "score" => DecisionsAnswer::Score(DecisionsScoreAnswer {
             name,
             score: num(obj, "score")?,
-            confidence: num(obj, "confidence")?,
+            confidence: probability(obj, "confidence")?,
             probabilities: objects(obj, "probabilities")?
                 .into_iter()
                 .map(|p| {
-                    let value = num(p, "value")?;
-                    if value.fract() != 0.0 || value.abs() > i64::MAX as f64 {
-                        return shape_err("Expected integer level 'value'.");
-                    }
                     Ok(DecisionsScoreProbability {
                         label: string(p, "label")?,
-                        value: value as i64,
-                        probability: num(p, "probability")?,
+                        value: integer(p.get("value"), "value")?,
+                        probability: probability(p, "probability")?,
                     })
                 })
                 .collect::<Shape<_>>()?,
@@ -1596,10 +1817,8 @@ fn parse_result_shape(json: &Value) -> Shape<DecisionsResult> {
     let Some(usage) = root.get("usage").and_then(Value::as_object) else {
         return shape_err("Expected object 'usage'.");
     };
-    let input_details = usage.get("input_tokens_details").and_then(Value::as_object);
-    let output_details = usage
-        .get("output_tokens_details")
-        .and_then(Value::as_object);
+    let input_details = optional_object(usage, "input_tokens_details")?;
+    let output_details = optional_object(usage, "output_tokens_details")?;
     let answers = objects(root, "answers")?
         .into_iter()
         .map(parse_answer)
@@ -1643,6 +1862,7 @@ type BodyStream = BoxStream<'static, Result<Bytes, BoxError>>;
 pub(crate) struct InboundResponse {
     pub(crate) status: u16,
     pub(crate) request_id: Option<String>,
+    pub(crate) retry_after_ms: Option<u64>,
     pub(crate) body: BodyStream,
 }
 
@@ -1657,18 +1877,11 @@ pub(crate) trait Transport: Send + Sync {
 }
 
 struct ReqwestTransport {
-    client: Result<reqwest::Client, String>,
+    client: Option<reqwest::Client>,
 }
 
 impl ReqwestTransport {
     fn new(client: Option<reqwest::Client>) -> Self {
-        let client = match client {
-            Some(client) => Ok(client),
-            None => crate::copilot_request_handler::SHARED_HTTP_CLIENT
-                .as_ref()
-                .cloned()
-                .map_err(|error| format!("HTTP TLS configuration failed: {error}")),
-        };
         Self { client }
     }
 }
@@ -1681,10 +1894,12 @@ impl Transport for ReqwestTransport {
         body: Bytes,
     ) -> BoxFuture<'a, Result<InboundResponse, BoxError>> {
         Box::pin(async move {
-            let client = self
-                .client
-                .as_ref()
-                .map_err(|e| BoxError::from(e.clone()))?;
+            let client = match &self.client {
+                Some(client) => client,
+                None => crate::copilot_request_handler::SHARED_HTTP_CLIENT
+                    .as_ref()
+                    .map_err(|_| BoxError::from("HTTP TLS configuration failed."))?,
+            };
             let mut map = reqwest::header::HeaderMap::with_capacity(headers.len());
             for (name, value) in headers {
                 let mut value = reqwest::header::HeaderValue::from_bytes(value.as_bytes())?;
@@ -1706,6 +1921,17 @@ impl Transport for ReqwestTransport {
                 .headers()
                 .get("x-request-id")
                 .map(|v| String::from_utf8_lossy(v.as_bytes()).into_owned());
+            let header = |name| {
+                response
+                    .headers()
+                    .get(name)
+                    .and_then(|value| value.to_str().ok())
+            };
+            let retry_after_ms = retry_after::parse(
+                header("retry-after-ms"),
+                header("retry-after"),
+                retry_after::now_epoch_ms(),
+            );
             let body = response
                 .bytes_stream()
                 .map(|chunk| chunk.map_err(|e| BoxError::from(e.without_url())))
@@ -1713,6 +1939,7 @@ impl Transport for ReqwestTransport {
             Ok(InboundResponse {
                 status,
                 request_id,
+                retry_after_ms,
                 body,
             })
         })
@@ -1724,6 +1951,7 @@ impl Transport for ReqwestTransport {
 async fn read_limited(body: &mut BodyStream, limit: usize) -> Result<(Vec<u8>, bool), BoxError> {
     let mut bytes = Vec::new();
     while let Some(chunk) = body.next().await {
+        tokio::task::consume_budget().await;
         let chunk = chunk?;
         let remaining = limit - bytes.len();
         if chunk.len() > remaining {
@@ -1745,13 +1973,49 @@ fn decode_utf8(bytes: &[u8]) -> String {
 /// trailing character is dropped entirely (never replaced with U+FFFD).
 fn truncate_utf8(mut text: String, max: usize) -> String {
     if text.len() > max {
-        let mut end = max;
-        while !text.is_char_boundary(end) {
-            end -= 1;
-        }
-        text.truncate(end);
+        text.truncate(char_boundary(&text, max));
     }
     text
+}
+
+fn char_boundary(text: &str, max: usize) -> usize {
+    let mut end = max.min(text.len());
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    end
+}
+
+/// Maps the original byte budget through BOM removal and lossy decoding.
+/// Invalid bytes may expand, but must not shift the original retention limit.
+fn decode_error_body(bytes: &[u8], exceeded: bool) -> (String, usize) {
+    let raw = bytes.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(bytes);
+    let budget = MAX_ERROR_BODY_BYTES.saturating_sub(bytes.len() - raw.len());
+    let mut text = String::new();
+    let mut offset = 0;
+    let mut retained_end = 0;
+    for chunk in raw.utf8_chunks() {
+        let valid = chunk.valid();
+        if offset < budget {
+            retained_end = text.len() + char_boundary(valid, budget - offset);
+        }
+        text.push_str(valid);
+        offset += valid.len();
+        let invalid = chunk.invalid();
+        if !invalid.is_empty() {
+            let incomplete = exceeded
+                && offset + invalid.len() == raw.len()
+                && std::str::from_utf8(invalid).is_err_and(|error| error.error_len().is_none());
+            if !incomplete {
+                text.push('\u{fffd}');
+                if offset + invalid.len() <= budget {
+                    retained_end = text.len();
+                }
+            }
+            offset += invalid.len();
+        }
+    }
+    (text, retained_end)
 }
 
 /// JavaScript `String(number)` for the common cases.
@@ -1776,21 +2040,19 @@ fn string_field(value: Option<&Value>) -> Option<String> {
 }
 
 /// Maps a non-2xx response to a [`DecisionsError`] (bounded, redacted). A
-/// lookahead window as long as the longest secret is read past the cap and
-/// redaction runs before truncation, so a credential that straddles the cap
-/// is never partially retained. `Err` means the body could not be read.
+/// lookahead window recognizes credentials crossing the ORIGINAL byte cap;
+/// no other content from that window is retained. `Err` means the body could
+/// not be read, so authentication refresh/replay must not occur.
 async fn http_error(
     mut response: InboundResponse,
     redactor: &Redactor,
 ) -> Result<DecisionsError, BoxError> {
-    let window = MAX_ERROR_BODY_BYTES + redactor.max_secret_bytes;
+    let window = MAX_ERROR_BODY_BYTES.saturating_add(redactor.max_secret_bytes);
     let (bytes, exceeded) = read_limited(&mut response.body, window).await?;
     drop(response.body);
-    let raw = decode_utf8(&bytes);
-    let redacted = redactor.redact(&raw);
+    let (raw, retained_end) = decode_error_body(&bytes, exceeded);
     let truncated = exceeded || bytes.len() > MAX_ERROR_BODY_BYTES;
-    // Cut even when not truncated: replacing short secrets with "[REDACTED]" can grow the text.
-    let body = truncate_utf8(redacted, MAX_ERROR_BODY_BYTES);
+    let body = redactor.redact_prefix(&raw, retained_end);
 
     let mut error_type = None;
     let mut error_code = None;
@@ -1804,7 +2066,7 @@ async fn http_error(
         error_type = redact("type");
         error_code = redact("code");
         error_param = redact("param");
-        error_message = redact("message");
+        error_message = string_field(error.get("message"));
     }
 
     let status = response.status;
@@ -1817,13 +2079,14 @@ async fn http_error(
         Some(m) if !m.is_empty() => format!("Decisions request failed with {status_text}: {m}"),
         _ => format!("Decisions request failed with {status_text}."),
     };
-    let mut error = decisions_error(DecisionsErrorKind::Http, message);
+    let mut error = decisions_error(DecisionsErrorKind::Http, redactor.redact(&message));
     error.http = Some(Box::new(HttpDetails {
         status,
         error_type,
         error_code,
         error_param,
-        request_id: response.request_id,
+        request_id: response.request_id.map(|id| redactor.redact(&id)),
+        retry_after_ms: response.retry_after_ms,
         body,
         body_truncated: truncated,
     }));
@@ -1881,6 +2144,7 @@ pub(crate) async fn execute<R, Fut>(
     transport: &dyn Transport,
     request: &DecisionsRequest,
     endpoint_model_id: Option<&str>,
+    timeout: Option<Duration>,
 ) -> Result<DecisionsResult, Error>
 where
     R: Fn(Option<String>) -> Fut,
@@ -1892,22 +2156,83 @@ where
             "DecisionsRequest.model is required.",
         ));
     }
+    let deadline = timeout
+        .map(|timeout| {
+            tokio::time::Instant::now()
+                .checked_add(timeout)
+                .ok_or_else(|| {
+                    Error::with_message(
+                        ErrorKind::InvalidConfig,
+                        "The Decisions timeout exceeds the supported duration.",
+                    )
+                })
+        })
+        .transpose()?;
+    check_deadline(deadline)?;
+    let operation = execute_inner(resolve, transport, request, endpoint_model_id, deadline);
+    let result = match deadline {
+        Some(deadline) => {
+            tokio::select! {
+                biased;
+                _ = tokio::time::sleep_until(deadline) => Err(timeout_error()),
+                result = operation => result,
+            }
+        }
+        None => operation.await,
+    };
+    check_deadline(deadline)?;
+    result
+}
 
+fn timeout_error() -> Error {
+    decisions_error(
+        DecisionsErrorKind::Timeout,
+        "The Decisions API call exceeded its total-call deadline.",
+    )
+    .into()
+}
+
+fn check_deadline(deadline: Option<tokio::time::Instant>) -> Result<(), Error> {
+    if deadline.is_some_and(|deadline| tokio::time::Instant::now() >= deadline) {
+        Err(timeout_error())
+    } else {
+        Ok(())
+    }
+}
+
+async fn execute_inner<R, Fut>(
+    resolve: R,
+    transport: &dyn Transport,
+    request: &DecisionsRequest,
+    endpoint_model_id: Option<&str>,
+    deadline: Option<tokio::time::Instant>,
+) -> Result<DecisionsResult, Error>
+where
+    R: Fn(Option<String>) -> Fut,
+    Fut: Future<Output = Result<ProviderEndpoint, Error>>,
+{
+    check_deadline(deadline)?;
     let endpoint = resolve_endpoint(&resolve, endpoint_model_id).await?;
+    check_deadline(deadline)?;
     let mut plan = plan_attempt(&endpoint, &request.model)?;
     let body = Bytes::from(serde_json::to_vec(request)?);
+    check_deadline(deadline)?;
     let mut response = send(transport, &plan, body.clone()).await?;
 
     if response.status == 401 || response.status == 403 {
         let original = read_http_error(response, &plan).await?;
+        check_deadline(deadline)?;
         let refreshed_endpoint = resolve_endpoint(&resolve, endpoint_model_id).await?;
-        let Ok(refreshed) = plan_attempt(&refreshed_endpoint, &request.model) else {
+        check_deadline(deadline)?;
+        let Ok(mut refreshed) = plan_attempt(&refreshed_endpoint, &request.model) else {
             return Err(original.into());
         };
         if refreshed.fingerprint == plan.fingerprint {
             return Err(original.into());
         }
+        refreshed.redactor.include(plan.redactor);
         plan = refreshed;
+        check_deadline(deadline)?;
         response = send(transport, &plan, body).await?;
     }
 
@@ -1969,7 +2294,8 @@ impl SessionDecisions<'_> {
     /// against the session's provider. Requires the runtime to run with
     /// `COPILOT_ALLOW_GET_PROVIDER_ENDPOINT=true`.
     ///
-    /// Cancel by dropping the returned future.
+    /// The 600-second deadline covers endpoint resolution, refresh, HTTP
+    /// attempts, and bodies. Cancel natively by dropping the returned future.
     pub async fn create(&self, request: DecisionsRequest) -> Result<DecisionsResult, Error> {
         self.create_with_options(request, DecisionsOptions::default())
             .await
@@ -1977,11 +2303,33 @@ impl SessionDecisions<'_> {
 
     /// **Experimental.** Like [`create`](Self::create), with per-call options.
     ///
-    /// Cancel by dropping the returned future.
+    /// Uses the same 600-second total-call deadline as [`create`](Self::create).
+    /// Cancel natively by dropping the returned future.
     pub async fn create_with_options(
         &self,
         request: DecisionsRequest,
         options: DecisionsOptions,
+    ) -> Result<DecisionsResult, Error> {
+        self.create_with_timeout(request, options, Some(DEFAULT_TIMEOUT))
+            .await
+    }
+
+    /// **Experimental.** Like [`create_with_options`](Self::create_with_options),
+    /// with an explicit total-call deadline covering endpoint resolution,
+    /// refresh, both HTTP attempts, and all body reads.
+    ///
+    /// `None` disables the SDK deadline; `Some(Duration::ZERO)` expires before
+    /// I/O. Expiry returns [`DecisionsErrorKind::Timeout`] without retaining a
+    /// provider cause. Missing model validation takes precedence.
+    ///
+    /// Dropping this future cancels in-flight HTTP work and drops response
+    /// bodies. The runtime-side endpoint RPC is not cancelled, but a late reply
+    /// cannot dispatch HTTP. No background task is spawned by this call.
+    pub async fn create_with_timeout(
+        &self,
+        request: DecisionsRequest,
+        options: DecisionsOptions,
+        timeout: Option<Duration>,
     ) -> Result<DecisionsResult, Error> {
         let session = self.session;
         let transport = ReqwestTransport::new(options.http_client);
@@ -2003,6 +2351,7 @@ impl SessionDecisions<'_> {
             &transport,
             &request,
             options.endpoint_model_id.as_deref(),
+            timeout,
         ))
         .await
     }

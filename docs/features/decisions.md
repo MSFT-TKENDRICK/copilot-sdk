@@ -5,13 +5,15 @@ The Decisions API evaluates supplied evidence and returns typed answers instead 
 `session.decisions.create(...)` calls OpenAI's `POST /v1/decisions` using **the session's provider endpoint and credentials**. The OpenAI reference currently documents `gpt-6-luna`; the SDK requires an explicit model but does not maintain its own model allowlist. Provider access and deployment availability still apply.
 
 > [!WARNING]
-> **This fork's Decisions extension is a preview, not production-ready.** Local tests pass, including a real Copilot CLI connected to a local test provider. Live OpenAI, Azure, and Copilot-managed Decisions requests have not been verified in this fork. Review also found unresolved credential-redaction defects on error paths. Keep evaluation on local test providers with synthetic credentials until those fixes are verified. See [Known limitations](#known-limitations).
+> **This fork's Decisions extension remains a preview, not production-ready.** The hardening pass addresses credential redaction, whole-call deadlines, response validation, and retry behavior, but complete six-SDK verification and mutation evidence are still pending. Live OpenAI and Azure requests have not been verified. Keep evaluation on local test providers with synthetic credentials until the remaining gates pass. See [Known limitations](#known-limitations).
 >
 > The API may change or be removed. It is hand-written on top of the existing `session.provider.getEndpoint` RPC, not a new generated runtime API.
 
 ## What has been verified
 
-At implementation commit `a8f5d650`, the Decisions suites passed in all six SDKs: Node.js, Python, Go, .NET, Java, and Rust. They exercise serialization, typed results, endpoint/header handling, credential refresh, cancellation, and bounded response reads using fixtures and test providers. Passing those tests does not invalidate the defects subsequently found by adversarial review.
+At implementation commit `a8f5d650`, the original Decisions suites passed in all six SDKs: Node.js, Python, Go, .NET, Java, and Rust. Adversarial review subsequently exposed gaps in those tests and the implementation. That historical baseline is not production-readiness evidence for the hardened version.
+
+The hardening corpus now has **133 shared cases per SDK**, plus language-specific regressions. Local Decisions suites have passed in Node.js, Python, Go, .NET, and Java. Rust validation, Node package-consumer execution, and the portable CI matrix are still being verified; the native Windows/ARM64 Go toolchain does not support the race detector, so that check runs separately on Linux. The [coverage and integrity tools](../../test/decisions/README.md) distinguish an assertion-backed vector census from runner success and check committed source rather than treating an agent's summary as proof.
 
 The [Python runtime tests](../../python/tests/test_decisions_runtime.py) also launch a real CLI process and verify both that an opted-in call reaches a local `/v1/decisions` endpoint and that a call without the runtime opt-in fails before reaching it. The local server returns a fixture; this verifies integration, **not a live model's answers or cloud service availability**. The multi-model design and implementation review has not converged, and the SDK mutation campaign is not complete.
 
@@ -34,6 +36,10 @@ The [Python runtime tests](../../python/tests/test_decisions_runtime.py) also la
 Only the `input` supplied to the call is evaluated. Session conversation history is not automatically included, and tool-call items in `input` are evidence, not instructions for the SDK to execute tools. Use `send` / `sendAndWait` for an agent conversation or tool-use loop instead.
 
 This placement follows the SDK's session-scoped API groups and reuses an existing runtime primitive. It adds no runtime RPC, generated-code edits, `wireApi: "decisions"` value, or new runtime HTTP dependency. The session's normal `wireApi` setting still concerns its agent-loop calls, not this separate operation.
+
+Relevant upstream precedents include [typed structured outputs across six SDKs (#2590)](https://github.com/github/copilot-sdk/pull/2590), [session-scoped GitHub token providers (#2412)](https://github.com/github/copilot-sdk/pull/2412), and [client-executed MCP search over Responses (#2765)](https://github.com/github/copilot-sdk/pull/2765). They inform the typed, session-scoped, compositional approach; they do not constitute upstream approval of this fork.
+
+The [request for user-delegated billing and a simple prompt/response API (#182)](https://github.com/github/copilot-sdk/issues/182) is a related use case, not a capability this extension promises. Reusing a session endpoint does not grant new model entitlements or establish billing-transfer semantics.
 
 ## Requirements
 
@@ -72,6 +78,8 @@ Probabilities and confidence values are model judgments, not guaranteed correctn
 
 Optional prompt-cache fields map to `prompt_cache_key` and `prompt_cache_options` on the wire. The current reference documents `ttl: "30m"`. Optional typed request fields set to `null` are omitted. Provider limits, including question counts, remain server-authoritative rather than being enforced as SDK policy.
 
+Question instructions support text, images, and JSON. They do not accept input-only cache breakpoints. Unsupported typed input items and invalid role/content combinations fail explicitly rather than silently becoming null array entries.
+
 If using `safetyIdentifier` / `safety_identifier`, supply an opaque identifier appropriate for abuse detection. Do not send a raw email address, username, credential, or other direct identifier; use an appropriate privacy-preserving mapping. Remember that the input itself is sent to the selected provider.
 
 ## Example
@@ -103,7 +111,7 @@ const result = await session.decisions.create(
             },
         ],
     },
-    { signal: AbortSignal.timeout(30_000) },
+    { timeoutMs: 30_000 },
 );
 
 for (const answer of result.answers) {
@@ -127,7 +135,7 @@ for (const answer of result.answers) {
 }
 ```
 
-The signal limits HTTP work, but cannot interrupt a pending runtime endpoint RPC. See the timeout notes below.
+This sets the SDK-owned deadline for the entire call. Pass an `AbortSignal` separately when the caller also needs native cancellation.
 
 </details>
 <details>
@@ -253,23 +261,30 @@ if let DecisionsAnswer::Predicate(answer) = &result.answers[0] {
 | Option | Meaning |
 |---|---|
 | Endpoint model id (`endpointModelId`, `endpoint_model_id`, ...) | Passed verbatim as `modelId` to `session.provider.getEndpoint`, to pick a different provider endpoint than the session's current one. Never derived from `model`. |
+| Total-call timeout | Defaults to 600 seconds, including endpoint lookup, both HTTP attempts, response bodies, and credential refresh. See the language-specific options below. |
 | Cancellation | `AbortSignal` (TypeScript), task cancellation (Python), `context.Context` (Go), `CancellationToken` (.NET), future cancellation (Java), or dropping the future (Rust). Explicit cancellation uses the platform's native cancellation mechanism, not a Decisions error. |
 | Custom HTTP client | For proxies or custom TLS. The SDK's built-in clients never follow redirects. Injected clients are trusted and **must disable redirects**; otherwise credentials could be forwarded to another origin. (.NET and Java reject injected clients that are configured to follow redirects.) |
 
 ### Timeouts and retries
 
-**There is no SDK-defined default total-call timeout.** Supply a deadline or cancellation mechanism; HTTP-stack defaults are not a portable whole-call guarantee.
+**The SDK-defined default total-call deadline is 600 seconds.** It covers endpoint lookup, HTTP headers and bodies, and the optional credential-refresh replay without resetting the budget between phases. SDK-owned expiry becomes error kind `timeout`; explicit caller cancellation remains native.
 
-| SDK | Current timeout/deadline behavior |
+| SDK | Configure or disable the SDK deadline |
 |---|---|
-| TypeScript | Pass `signal`, for example `AbortSignal.timeout(30_000)`. It is checked before and after endpoint resolution and passed to `fetch`; the runtime RPC itself cannot be aborted. |
-| Python | `timeout=30.0` bounds the whole call, including resolution and a credential-refresh retry; expiry raises native `TimeoutError`. The default `None` is unbounded. |
-| Go | Pass a context created with `context.WithTimeout` / `context.WithDeadline`. |
-| .NET | Pass a `CancellationToken` from a timed `CancellationTokenSource` to `CreateAsync`. |
-| Java | `DecisionsOptions.setTimeout(Duration)` configures the HTTP request timeout, not a full-call deadline covering endpoint resolution and streaming body reads. Cancel the returned future explicitly; body/deadline hardening remains under review. |
-| Rust | Bound the awaited call with the application's async deadline mechanism; dropping the future cancels the operation. |
+| TypeScript | `timeoutMs: 30_000`; omitted uses the default, `null` disables it. Other values must be finite and positive. |
+| Python | `timeout=30.0`; omitted uses the default, `None` disables it. Other values must be finite and positive. |
+| Go | `DecisionsOptions.Timeout` is a duration pointer; nil uses the default, a pointer to zero disables it, and negative values are invalid. Caller context deadlines remain independent. |
+| .NET | `DecisionsOptions.Timeout` is a nullable `TimeSpan`; null uses the default, `Timeout.InfiniteTimeSpan` disables it, and other values must be positive. |
+| Java | `DecisionsOptions.setTimeout(Duration)` now bounds the whole call; `Duration.ZERO` disables it and negative values are invalid. |
+| Rust | Existing `create` and `create_with_options` calls use the default. The additive `create_with_timeout(request, options, Option<Duration>)` accepts `None` to disable it; zero expires before I/O. |
 
-After a readable HTTP 401 or 403, the SDK resolves the endpoint once more and replays the request only if the effective URL or credentials changed. It does not retry for changes to incidental headers alone. There are no automatic retries for 429, 5xx, or general network failures, and no built-in backoff or `Retry-After` handling. A replay is another provider request and may incur another charge; this is not an exactly-once operation. See the Go error-body limitation below.
+An endpoint RPC that cannot be cancelled may finish later, but the SDK stops waiting and must not dispatch HTTP after expiry. Synchronous serialization cannot be preempted; expiry is checked before subsequent I/O. Injected transports remain responsible for their own cancellation/resource behavior, and an earlier caller-configured HTTP-stack timeout is distinct from the SDK deadline.
+
+After a successfully processed bounded HTTP 401 or 403 body, the SDK resolves the endpoint once more and replays the request only if the effective URL or credentials changed. An unreadable authentication body stops with a network, timeout, or cancellation outcome; it does not trigger refresh. Incidental header changes alone do not cause replay. An invalid refreshed plan preserves the original HTTP error; an unsuccessful refresh lookup becomes a safe `endpointUnavailable` error.
+
+There are **no automatic retries for 429, 5xx, or general network failures**, and no built-in backoff. Errors may expose advisory `retryAfterMs` (or the language equivalent): valid `retry-after-ms` takes precedence over numeric or canonical GMT `Retry-After`; fractional delays round up to milliseconds and past dates clamp to zero. Invalid or overflowing hints are ignored. Your application chooses whether and when to retry.
+
+A replay is another provider request and may incur another charge; this is not an exactly-once operation.
 
 ## Errors
 
@@ -282,23 +297,26 @@ Failures raise a Decisions error (`DecisionsError`, `DecisionsException`, or the
 | `unsupportedProvider` / `unsupportedTransport` | The provider is not OpenAI or Azure, or the transport is not HTTP. |
 | `modelMismatch` | The request `model` conflicts with the endpoint's fixed deployment. |
 | `credentialConflict` | The endpoint headers conflict with the SDK's credential header. |
-| `http` | A non-2xx response. Includes `status`, OpenAI `errorType`/`errorCode`/`errorParam`, `requestId`, and `body` (at most 64 KiB, with `bodyTruncated`). Redaction has known gaps; do not assume these fields are safe to log. |
+| `http` | A non-2xx response. Includes `status`, OpenAI `errorType`/`errorCode`/`errorParam`, `requestId`, advisory `retryAfterMs`, and bounded/redacted `body` with `bodyTruncated` where available. |
 | `invalidResponse` | The response is not valid Decisions JSON or exceeds 8 MiB. |
-| `network` | The request or response-body read failed in transit. A reduced `cause` is retained, but metadata redaction has known gaps. |
+| `network` | The request or response-body read failed in transit. A reduced, redacted diagnostic cause may be retained, not the raw provider exception. |
+| `timeout` | The SDK-owned total-call deadline expired. This is not the caller's native cancellation outcome. |
 
-The implementation attempts to redact recognized secrets from HTTP messages, bodies, parsed error fields, and network causes. Its current secret collection uses a minimum of eight Unicode scalar values and includes JSON/URL-encoded forms. This is **not a guarantee that an error is credential-free**. `endpointUnavailable` also preserves the original runtime RPC error as its cause.
+Known numeric measurements must be finite. Missing usage counts default to zero, but present malformed counts are rejected rather than coerced. Native SDKs preserve signed 64-bit integer tokens; TypeScript rejects integers outside JavaScript's safe range instead of silently rounding them. Integral decimal/exponent forms are accepted only within the portable safe-integer range.
 
-Until the redaction fixes land, do not log whole error objects, their bodies/messages, request IDs, or causes. Prefer fixed diagnostic labels and the SDK-defined `kind` and HTTP `status`. This reduces exposure; it does not make the preview production-ready.
+The hardened redactor protects every nonempty configured credential after space/tab trimming, including short credentials. Other header/query candidates retain the eight-Unicode-scalar heuristic. Literal, JSON-escaped, percent/form-encoded, and raw-query representations are tracked across both attempts. Matches are found against the original text and overlapping intervals are merged before replacement.
+
+HTTP diagnostic bodies retain at most the original first 64 KiB of UTF-8, with bounded secret-matching lookahead that is never copied into retained output. Replacement expansion is capped again. `bodyTruncated` describes original overflow, not the size after redaction. Provider-controlled request IDs, error fields, and retained cause strings are also bounded/redacted; endpoint lookup failures do not retain raw runtime exception chains.
+
+This is not general PII removal, arbitrary-encoding detection, or memory erasure. Successful results and unknown raw payloads can contain sensitive provider content; runtime/transport tracing, debugger dumps, and caller-owned logs are outside this Decisions-error guarantee. Prefer fixed labels, `kind`, and `status` over logging whole error objects or response bodies.
 
 ## Known limitations
 
-The following remain unresolved in the current implementation; documenting them does not fix them:
-
-* **Error-path credential exposure.** Provider-supplied request IDs and some transport cause metadata bypass redaction. Truncation after earlier replacements can retain a partial secret from the lookahead region, and overlapping secrets are not fully covered. Credentials shorter than the collection threshold are not protected by that redactor.
-* **Go interrupted authentication responses.** An unreadable 401/403 body can lead to a credential refresh and replay instead of stopping with a network error.
-* **Malformed data and cross-language edge cases.** Examples include Node serializing an unrecognized runtime input-item type as a null array entry and Python exposing `OverflowError` for an extremely large JSON number. Numeric-domain and content-part differences are still being adjudicated.
-* **Operational metadata and extensibility.** Success results do not expose the response request ID. Errors do not expose a parsed retry delay. There is a raw input-item escape hatch, but no equivalent raw-question or top-level `extraBody` interface.
-* **Incomplete validation.** Live provider calls and SDK mutation coverage remain unverified. The recorded .NET format check did not complete, and Rust all-target Clippy reported a `registered_session_ids` dead-code failure. Neither is counted as a passing check.
+* **Incomplete verification.** The complete hardened six-SDK build/test/format matrix and isolated SDK mutation campaign are not yet accepted as passing. Earlier failed or interrupted runs are not counted as success, even when their shared-vector assertions passed.
+* **Live access is unverified.** Local providers and a real CLI do not prove OpenAI/Azure entitlement, deployment compatibility, or live model behavior. Copilot-managed access has an additional runtime entitlement boundary; there is no fallback or bypass.
+* **Operational metadata and extensibility.** Success results do not expose the response request ID. There is a raw input-item escape hatch, but no equivalent raw-question or top-level `extraBody` interface. Advisory retry hints do not imply those other capabilities.
+* **Transport and diagnostic boundaries.** Injected clients must preserve redirect safety and cancellation/resource behavior. Redaction is limited to recognized credential representations in SDK diagnostics, not arbitrary successful data or application logs.
+* **Intentional numeric differences.** TypeScript cannot represent every native signed 64-bit integer exactly and rejects unsafe values. All SDKs preserve fractional scalar scores; callers must not treat them as array indices.
 
 ## Why not just use the OpenAI or Jev SDK?
 
@@ -314,7 +332,7 @@ The extension preserves **OpenAI's native contract**, rather than inventing a co
 | Primitives | `predicate`, `choice`, `score`; answers may be refusals | `noul`, `choice`, `score`, `box` |
 | Integration here | Typed, session-scoped call using the runtime's endpoint | No Jev endpoint, schema conversion, or `box` support |
 
-Jev/OpenAI SDK conveniences such as richer retry metadata and builders informed the comparison, but are not all implemented here. In particular, this extension does not silently inherit another SDK's retries or timeout defaults. Use the call options and limitations documented above as its actual contract.
+Jev/OpenAI SDK conveniences informed the comparison, but are not all implemented here. This extension defines its own explicit whole-call deadline and advisory retry-hint behavior; it does not silently inherit another SDK's automatic retries. Optional conveniences are not wire-conformance requirements merely because another SDK exposes them.
 
 ## Reproduce the local checks
 
@@ -323,16 +341,17 @@ After setting up the fork's development dependencies, run from `nodejs`:
 ```powershell
 npx --no-install vitest run test\decisions.test.ts
 npm run typecheck
+npx --no-install tsc --noEmit -p tsconfig.test.json
 ```
 
 From `python`, set `COPILOT_CLI_PATH` to a compatible CLI executable and run:
 
 ```powershell
 $env:COPILOT_CLI_PATH = "C:\path\to\copilot.exe"
-uv run --no-sync pytest tests\test_decisions.py tests\test_decisions_runtime.py -q
+uv run --no-sync pytest tests\test_decisions.py tests\test_decisions_production.py tests\test_decisions_runtime.py test_jsonrpc.py test_rpc_timeout.py -q
 ```
 
-Without `COPILOT_CLI_PATH`, the two runtime tests are skipped. These tests use a local test provider and synthetic credentials, not a live OpenAI account. Fixture coverage and source are in [`test/fixtures/decisions`](../../test/fixtures/decisions), [`nodejs/test/decisions.test.ts`](../../nodejs/test/decisions.test.ts), and [`python/tests/test_decisions.py`](../../python/tests/test_decisions.py).
+Without `COPILOT_CLI_PATH`, the two runtime tests are skipped; that does not satisfy the runtime-integration gate. They use a local provider and synthetic credentials, not a live OpenAI account. See [evidence-tool instructions](../../test/decisions/README.md) for census capture and committed-range integrity verification. Fixture coverage and source are in [`test/fixtures/decisions`](../../test/fixtures/decisions), [`nodejs/test/decisions.test.ts`](../../nodejs/test/decisions.test.ts), and [`python/tests/test_decisions_production.py`](../../python/tests/test_decisions_production.py).
 
 ## See also
 

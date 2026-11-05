@@ -8,6 +8,7 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertInstanceOf;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertSame;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import java.io.InputStream;
@@ -15,7 +16,9 @@ import java.io.OutputStream;
 import java.net.InetAddress;
 import java.net.ServerSocket;
 import java.net.Socket;
+import java.net.SocketTimeoutException;
 import java.nio.charset.StandardCharsets;
+import java.time.Duration;
 import java.util.List;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutionException;
@@ -88,6 +91,45 @@ class DecisionsSessionAccessorTest {
                 assertTrue(modelId == null || modelId.isNull());
                 sockets.respond(second, anthropic);
                 assertUnsupported(withoutModel);
+            } finally {
+                session.forceStopLocally();
+            }
+        }
+    }
+
+    @Test
+    void lateEndpointRpcResponseCannotDispatchHttpAfterDeadline() throws Exception {
+        try (var sockets = new SocketPair(); var http = new ServerSocket(0, 1, InetAddress.getByName("127.0.0.1"))) {
+            var session = new CopilotSession("sess-decisions-deadline", sockets.rpc);
+            try {
+                // Keep cold HTTP/RPC class loading outside the short pending-RPC deadline.
+                CompletableFuture<DecisionsResult> warmup = session.getDecisions().create(request(),
+                        new DecisionsOptions().setTimeout(Duration.ZERO));
+                sockets.respond(sockets.readOneMessage(), MAPPER.createObjectNode().put("type", "anthropic")
+                        .put("baseUrl", "https://api.anthropic.com").set("headers", MAPPER.createObjectNode()));
+                assertUnsupported(warmup);
+
+                CompletableFuture<DecisionsResult> expired = session.getDecisions().create(request(),
+                        new DecisionsOptions().setTimeout(Duration.ofMillis(250)));
+                JsonNode first = sockets.readOneMessage();
+                ExecutionException failure = assertThrows(ExecutionException.class,
+                        () -> expired.get(5, TimeUnit.SECONDS));
+                assertEquals(DecisionsErrorKind.TIMEOUT,
+                        assertInstanceOf(DecisionsException.class, failure.getCause()).getKind());
+                ObjectNode endpoint = MAPPER.createObjectNode().put("type", "openai")
+                        .put("baseUrl", "http://127.0.0.1:" + http.getLocalPort() + "/v1")
+                        .put("apiKey", "synthetic-rpc-late-key");
+                endpoint.putObject("headers");
+                sockets.respond(first, endpoint);
+
+                // A second response is an inbound-processing barrier for the first RPC.
+                CompletableFuture<DecisionsResult> barrier = session.getDecisions().create(request());
+                JsonNode second = sockets.readOneMessage();
+                endpoint.put("type", "anthropic");
+                sockets.respond(second, endpoint);
+                assertUnsupported(barrier);
+                http.setSoTimeout(250);
+                assertThrows(SocketTimeoutException.class, http::accept);
             } finally {
                 session.forceStopLocally();
             }

@@ -1,5 +1,5 @@
 {
-  "$comment": "Normative behavior vectors for session.decisions. Endpoints use the ProviderEndpoint wire shape. Header expectations use lowercase names and list the COMPLETE outbound header set. All six SDK test suites must pass every vector. Redaction vectors: when `bodyPrefix` is present, the response body is `char` repeated `count` times followed by `body`; `mustNotContain` applies to message, body, and all error fields. When `bodyTruncated` is present it must match; it is true only when the RAW body exceeded 64 KiB (or the stream overflowed), never merely because redaction expanded the text. When `bodyRepeat` is present, every `{{repeat}}` in `body` is replaced by `bodyRepeat.text` repeated `bodyRepeat.count` times. `maxBodyBytes`, when present, bounds the UTF-8 byte length of the returned error body (the redacted body is always cut to 64 KiB on a character boundary). Secret minimum length (8) is measured in Unicode scalar values after SP/HTAB trimming; `redactionLength` vectors use the value as an apiKey and check whether it is redacted from an error body that echoes it. Hex digits in \\uXXXX and %XX escapes match case-insensitively; `+` is accepted for space.",
+  "$comment": "Normative session.decisions vectors; all six SDKs execute every case. Endpoints use ProviderEndpoint wire shape. Header expectations are the COMPLETE lowercase outbound set. bodyPrefix prepends char repeated count times; bodyRepeat substitutes every {{repeat}} with text repeated count times. mustNotContain applies to every retained error/cause field. bodyTruncated means original RAW body overflow beyond 65536 UTF-8 bytes, not redaction expansion. Retain only the original 65536-byte prefix, using lookahead solely to recognize crossing secrets; union overlapping original matches before replacement, then enforce maxBodyBytes on a UTF-8 boundary. Every nonempty actual credential is protected; only heuristic non-authentication header/query candidates use an eight-Unicode-scalar minimum. redactionLength values are apiKey credentials after SP/HTAB trimming. Hex digits in \\uXXXX and %XX escapes match case-insensitively; + is accepted for space. production-vectors.json extends this corpus with metadata, numeric, retry-guidance, body-failure, and deadline cases.",
   "url": [
     {
       "name": "openai_v1",
@@ -170,6 +170,71 @@
         "baseUrl": "https://:@api.openai.com/v1",
         "headers": {}
       },
+      "error": "invalidEndpoint"
+    },
+    {
+      "name": "ipv6_loopback",
+      "endpoint": {"type": "openai", "baseUrl": "http://[::1]:8080/v1", "headers": {}},
+      "expected": "http://[::1]:8080/v1/decisions"
+    },
+    {
+      "name": "ipv6_https_nondefault_port",
+      "endpoint": {"type": "openai", "baseUrl": "https://[::1]:8443/v1", "headers": {}},
+      "expected": "https://[::1]:8443/v1/decisions"
+    },
+    {
+      "name": "canonical_host_port_dot_path_empty_query",
+      "endpoint": {"type": "openai", "baseUrl": "HTTPS://API.EXAMPLE.COM:443/a/../v1/?", "headers": {}},
+      "expected": "https://api.example.com/v1/decisions"
+    },
+    {
+      "name": "encoded_dot_segments",
+      "endpoint": {"type": "openai", "baseUrl": "https://api.example.com/a/%2e%2E/v1", "headers": {}},
+      "expected": "https://api.example.com/v1/decisions"
+    },
+    {
+      "name": "encoded_slash_preserved",
+      "endpoint": {"type": "openai", "baseUrl": "https://api.example.com/a%2Fb/v1", "headers": {}},
+      "expected": "https://api.example.com/a%2Fb/v1/decisions"
+    },
+    {
+      "name": "explicit_authority_required",
+      "endpoint": {"type": "openai", "baseUrl": "https:api.example.com/v1", "headers": {}},
+      "error": "invalidEndpoint"
+    },
+    {
+      "name": "raw_backslash_rejected",
+      "endpoint": {"type": "openai", "baseUrl": "https://api.example.com\\v1", "headers": {}},
+      "error": "invalidEndpoint"
+    },
+    {
+      "name": "raw_whitespace_rejected",
+      "endpoint": {"type": "openai", "baseUrl": " https://api.example.com/v1", "headers": {}},
+      "error": "invalidEndpoint"
+    },
+    {
+      "name": "raw_control_rejected",
+      "endpoint": {"type": "openai", "baseUrl": "https://api.example.com/\tv1", "headers": {}},
+      "error": "invalidEndpoint"
+    },
+    {
+      "name": "unencoded_unicode_uri_rejected",
+      "endpoint": {"type": "openai", "baseUrl": "https://api.example.com/v1?tag=\u00e9", "headers": {}},
+      "error": "invalidEndpoint"
+    },
+    {
+      "name": "port_above_uint16_rejected",
+      "endpoint": {"type": "openai", "baseUrl": "https://api.example.com:65536/v1", "headers": {}},
+      "error": "invalidEndpoint"
+    },
+    {
+      "name": "nonnumeric_port_rejected",
+      "endpoint": {"type": "openai", "baseUrl": "https://api.example.com:no/v1", "headers": {}},
+      "error": "invalidEndpoint"
+    },
+    {
+      "name": "invalid_percent_escape_rejected",
+      "endpoint": {"type": "openai", "baseUrl": "https://api.example.com/v%zz", "headers": {}},
       "error": "invalidEndpoint"
     }
   ],
@@ -460,6 +525,21 @@
         }
       },
       "error": "invalidEndpoint"
+    },
+    {
+      "name": "header_vertical_tab_rejected",
+      "endpoint": {"type": "openai", "baseUrl": "https://api.example.com/v1", "headers": {"X-Bad": "one\u000btwo"}},
+      "error": "invalidEndpoint"
+    },
+    {
+      "name": "header_del_rejected",
+      "endpoint": {"type": "openai", "baseUrl": "https://api.example.com/v1", "headers": {"X-Bad": "one\u007ftwo"}},
+      "error": "invalidEndpoint"
+    },
+    {
+      "name": "header_internal_horizontal_tab_preserved",
+      "endpoint": {"type": "openai", "baseUrl": "https://api.example.com/v1", "headers": {"X-Trace": "one\ttwo"}},
+      "expected": {"x-trace": "one\ttwo", "content-type": "application/json", "accept": "application/json"}
     }
   ],
   "retry": [
@@ -898,13 +978,53 @@
       "errorType": "invalid_request_error",
       "bodyTruncated": false,
       "maxBodyBytes": 65536
+    },
+    {
+      "name": "redaction_shrink_must_not_expose_lookahead",
+      "endpoint": {"type": "openai", "baseUrl": "https://api.example.com/v1", "apiKey": "abcdefghijklmnopqrst", "headers": {}},
+      "status": 400,
+      "bodyRepeat": {"text": "x", "count": 65497},
+      "body": "abcdefghijklmnopqrstabcdefghijklmnopqrst{{repeat}}abcdefghijklmnopqrst tail",
+      "mustNotContain": ["abcdefgh", "abcdefghijklmnopqrs"],
+      "errorCode": null,
+      "errorType": null,
+      "bodyTruncated": true,
+      "maxBodyBytes": 65536
+    },
+    {
+      "name": "overlapping_secrets_union_before_replacement",
+      "endpoint": {
+        "type": "openai",
+        "baseUrl": "https://api.example.com/v1",
+        "apiKey": "abcdefghij",
+        "headers": {},
+        "sessionToken": {"header": "X-Session", "token": "efghijklmn"}
+      },
+      "status": 400,
+      "body": "{\"error\":{\"type\":\"invalid_request_error\",\"code\":\"overlap\",\"message\":\"abcdefghijklmn\"}}",
+      "mustNotContain": ["abcdefgh", "efghijklmn", "klmn"],
+      "errorCode": "overlap",
+      "errorType": "invalid_request_error",
+      "bodyTruncated": false,
+      "maxBodyBytes": 65536
+    },
+    {
+      "name": "self_overlapping_secret_matches",
+      "endpoint": {"type": "openai", "baseUrl": "https://api.example.com/v1", "apiKey": "abababab", "headers": {}},
+      "status": 400,
+      "body": "{\"error\":{\"type\":\"invalid_request_error\",\"code\":\"overlap\",\"message\":\"abababababab\"}}",
+      "mustNotContain": ["abab"],
+      "errorCode": "overlap",
+      "errorType": "invalid_request_error",
+      "bodyTruncated": false,
+      "maxBodyBytes": 65536
     }
   ],
   "redactionLength": [
     {
-      "name": "seven_scalars_not_secret",
+      "name": "seven_scalar_credential_is_secret",
       "value": "🔑🔑🔑🔑abc",
-      "isSecret": false
+      "isSecret": true
     },
     {
       "name": "eight_scalars_secret",
@@ -912,9 +1032,14 @@
       "isSecret": true
     },
     {
-      "name": "trimmed_below_minimum",
+      "name": "trimmed_short_credential_is_secret",
       "value": " 1234567 ",
-      "isSecret": false
+      "isSecret": true
+    },
+    {
+      "name": "one_scalar_credential_is_secret",
+      "value": "Z",
+      "isSecret": true
     }
   ]
 }

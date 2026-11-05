@@ -1795,6 +1795,65 @@ formatting do not include the data payload.
 Avoid logging it indiscriminately: server-provided data may contain sensitive
 information.
 
+## Decisions (experimental)
+
+`session.Decisions.CreateAsync(request, options, cancellationToken)` sends a typed
+request directly to the session's OpenAI/Azure provider, without an agent turn or
+session history. The runtime must permit `session.provider.getEndpoint` through
+`COPILOT_ALLOW_GET_PROVIDER_ENDPOINT=true`. `request.Model` is required;
+`options.EndpointModelId` independently selects the endpoint.
+
+`DecisionsOptions.Timeout` is a **total-call** deadline covering endpoint lookup,
+HTTP headers/bodies, and credential refresh. `null` defaults to 600 seconds,
+`Timeout.InfiniteTimeSpan` disables it, and other values must be positive.
+Expiry raises `DecisionsException` with `Kind == DecisionsErrorKind.Timeout` and
+no provider cause. Caller cancellation remains `OperationCanceledException` and
+takes precedence. Built-in HTTP clients have no earlier independent timeout.
+
+Question instructions accept text, image, and JSON parts. Input cache breakpoints on
+otherwise-valid question parts are omitted; assistant/refusal parts are rejected.
+Input message roles retain their documented content restrictions,
+including JSON objects/arrays of objects for user messages. Only the `30m`
+prompt-cache TTL is documented. Score-probability indices and usage counts are
+signed 64-bit integers; score values remain fractional.
+
+HTTP errors expose advisory `RetryAfterMs` from `retry-after-ms` or `Retry-After`.
+It never schedules a retry. The only automatic replay is one fully processed
+401/403 after the effective endpoint URL or credentials change. An unreadable
+authentication-error body does not trigger credential refresh or replay.
+
+Retained diagnostics redact known endpoint credentials across both attempts, including short ones,
+and recognized literal, JSON, percent, and form encodings. Other endpoint
+header/query values use an eight-Unicode-scalar heuristic. Eligible query values
+retain both raw and decoded forms for matching, including lossy UTF-8 decoding. Overlapping matches
+are replaced together. Error bodies retain only the original first 64 KiB of
+UTF-8; lookahead recognizes crossing secrets without becoming retained content.
+All diagnostic strings have a final 64 KiB output cap. This is not general PII
+removal or a guarantee for arbitrary transformations; avoid indiscriminate logging.
+Raw endpoint-resolution exceptions and arbitrary transport-exception chains are
+not retained.
+
+Endpoint URLs must be explicit ASCII `http://` or `https://` URLs; encode Unicode
+components with percent encoding/IDNA. Credentials in URLs, malformed escapes,
+whitespace, controls, and backslashes are rejected. Built-in transports never
+follow redirects. Injected handlers remain caller-owned, must honor cancellation,
+and are responsible for TLS and redirect policy; standard handlers configured
+to follow redirects are rejected.
+
+For the local, synthetic Decisions suite (no provider credentials, bundled CLI,
+or Node test harness required), from `dotnet`:
+
+```bash
+DOTNET_PROCESSOR_COUNT=2 dotnet test test/GitHub.Copilot.SDK.Test.csproj \
+  -f net8.0 --filter FullyQualifiedName~GitHub.Copilot.Test.Unit.DecisionsTests \
+  -p:CopilotSkipCliDownload=true -m:2
+```
+
+Set `COPILOT_DECISIONS_VECTOR_CENSUS` to an output JSON path to record each shared
+vector only after its assertions pass. A census is not a substitute for a
+successful test-run exit. The full request is compared with the unchanged shared
+golden, including its typed question JSON.
+
 ## Development
 
 Development requires [.NET SDK 10+](https://dotnet.microsoft.com/download) and a supported [Node.js version](../nodejs/README.md#prerequisites). From the repository root:

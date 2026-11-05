@@ -43,8 +43,8 @@ public sealed interface DecisionsContentPart {
     }
 
     /**
-     * Parts allowed in question instructions: text, image, and JSON. Cache
-     * breakpoints are not meaningful in instructions.
+     * Parts allowed in question instructions: text, image, and JSON. Input-only
+     * cache breakpoints are omitted when serializing instructions.
      */
     sealed interface QuestionPart extends DecisionsContentPart {
     }

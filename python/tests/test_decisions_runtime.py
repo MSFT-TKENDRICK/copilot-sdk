@@ -63,7 +63,7 @@ class _DecisionsServer:
                 self.end_headers()
                 self.wfile.write(response_body)
 
-            def log_message(self, *args) -> None:
+            def log_message(self, format: str, *args) -> None:
                 pass
 
         self._server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
@@ -77,6 +77,8 @@ class _DecisionsServer:
     def close(self) -> None:
         self._server.shutdown()
         self._server.server_close()
+        self._thread.join(timeout=5)
+        assert not self._thread.is_alive()
 
 
 @pytest.fixture(scope="module")
