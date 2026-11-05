@@ -38,7 +38,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     env:
-      EVIDENCE_DIR: ${{ github.workspace }}/../decisions-integrity
+      EVIDENCE_DIR: ${{ github.workspace }}-decisions-integrity
       REQUESTED_BASE: ${{ github.event.pull_request.base.sha || inputs.base_sha }}
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
@@ -96,7 +96,7 @@ jobs:
           - version: "22.23.4"
             label: primary
     env:
-      EVIDENCE_DIR: ${{ github.workspace }}/../decisions-node-${{ matrix.label }}
+      EVIDENCE_DIR: ${{ github.workspace }}-decisions-node-${{ matrix.label }}
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
         with:
@@ -113,7 +113,10 @@ jobs:
           mkdir -p "$EVIDENCE_DIR"
           node --version
           npm --version
-          npm --prefix nodejs install --no-package-lock --no-audit --no-fund \
+          npm exec --yes --package=npm@11.21.0 -- npm --version
+          npm exec --yes --package=npm@11.21.0 -- npm --prefix nodejs install \
+            --no-package-lock --no-audit --no-fund --loglevel verbose \
+            --logs-dir "$EVIDENCE_DIR/npm-debug" \
             2>&1 | tee "$EVIDENCE_DIR/install.log"
       - name: Typecheck and execute Decisions tests
         working-directory: nodejs
@@ -158,7 +161,7 @@ jobs:
           - version: "3.12"
             label: primary
     env:
-      EVIDENCE_DIR: ${{ github.workspace }}/../decisions-python-${{ matrix.label }}
+      EVIDENCE_DIR: ${{ github.workspace }}-decisions-python-${{ matrix.label }}
       UV_CONCURRENT_BUILDS: "2"
       UV_CONCURRENT_INSTALLS: "2"
     steps:
@@ -178,7 +181,7 @@ jobs:
           python -m pip install uv==0.10.9
           uv sync --locked --group dev --python "${{ matrix.version }}" \
             2>&1 | tee "$EVIDENCE_DIR/sync.log"
-      - name: Provision and identify the real CLI
+      - name: Provision and identify the real runtime
         working-directory: python
         run: |
           export COPILOT_CLI_EXTRACT_DIR="$RUNNER_TEMP/decisions-cli/1.0.106-6"
@@ -186,7 +189,9 @@ jobs:
             2>&1 | tee "$EVIDENCE_DIR/runtime-download.log"
           cli_path="$(uv run --no-sync python -c \
             'from copilot._cli_download import ensure_runtime_wrapper; print(ensure_runtime_wrapper("1.0.106-6"))')"
-          "$cli_path" --version 2>&1 | tee "$EVIDENCE_DIR/runtime-version.log"
+          printf 'Requested runtime release: %s\n' '1.0.106-6' \
+            | tee "$EVIDENCE_DIR/runtime-identity.log"
+          sha256sum "$cli_path" | tee -a "$EVIDENCE_DIR/runtime-identity.log"
           echo "COPILOT_CLI_PATH=$cli_path" >> "$GITHUB_ENV"
       - name: Execute Decisions and RPC regressions
         working-directory: python
@@ -234,7 +239,7 @@ jobs:
     timeout-minutes: 30
     env:
       GOMAXPROCS: "2"
-      EVIDENCE_DIR: ${{ github.workspace }}/../decisions-go-primary
+      EVIDENCE_DIR: ${{ github.workspace }}-decisions-go-primary
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
         with:
@@ -280,7 +285,7 @@ jobs:
     env:
       DOTNET_PROCESSOR_COUNT: "2"
       DOTNET_CLI_TELEMETRY_OPTOUT: "1"
-      EVIDENCE_DIR: ${{ github.workspace }}/../decisions-dotnet-primary
+      EVIDENCE_DIR: ${{ github.workspace }}-decisions-dotnet-primary
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
         with:
@@ -334,12 +339,17 @@ jobs:
     timeout-minutes: 40
     env:
       JAVA_TOOL_OPTIONS: -XX:ActiveProcessorCount=2 -Xms64m -Xmx1024m
-      EVIDENCE_DIR: ${{ github.workspace }}/../decisions-java-primary
+      EVIDENCE_DIR: ${{ github.workspace }}-decisions-java-primary
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
         with:
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
           persist-credentials: false
+      - uses: actions/setup-java@be666c2fcd27ec809703dec50e508c2fdc7f6654
+        id: java17
+        with:
+          distribution: microsoft
+          java-version: "17"
       - uses: actions/setup-java@be666c2fcd27ec809703dec50e508c2fdc7f6654
         with:
           distribution: microsoft
@@ -359,11 +369,70 @@ jobs:
             2>&1 | tee "$EVIDENCE_DIR/verify.log"
           ./mvnw -B -pl sdk spotless:check checkstyle:check \
             2>&1 | tee "$EVIDENCE_DIR/style.log"
-          cp -R sdk/target/surefire-reports "$EVIDENCE_DIR/"
+          mv sdk/target/surefire-reports "$EVIDENCE_DIR/reports-jdk25"
           cp sdk/target/copilot-sdk-java-*.jar "$EVIDENCE_DIR/"
           cd ..
           python test/decisions/verify_coverage.py --sdk java "$EVIDENCE_DIR/census.json" \
             --output "$EVIDENCE_DIR/coverage.json"
+      - name: Execute the same Decisions suite on Java 17
+        working-directory: java
+        env:
+          JAVA17_HOME: ${{ steps.java17.outputs.path }}
+        run: |
+          "$JAVA17_HOME/bin/java" -version 2>&1 | tee "$EVIDENCE_DIR/java17-version.log"
+          export COPILOT_DECISIONS_VECTOR_CENSUS="$EVIDENCE_DIR/census-jdk17.json"
+          ./mvnw -o -B -Pskip-test-harness -DskipITs=true -pl sdk \
+            jacoco:prepare-agent@wire-up-coverage-instrumentation surefire:test@default-test \
+            '-Dtest=DecisionsTest*,DecisionsSessionAccessorTest' \
+            "-Djvm=$JAVA17_HOME/bin/java" '-Dsurefire.jvm.args=' -DforkCount=1 \
+            -DfailIfNoTests=true -Dsurefire.failIfNoSpecifiedTests=true \
+            2>&1 | tee "$EVIDENCE_DIR/java17-tests.log"
+          mv sdk/target/surefire-reports "$EVIDENCE_DIR/reports-jdk17"
+          python ../test/decisions/verify_coverage.py --sdk java \
+            "$EVIDENCE_DIR/census-jdk17.json" --output "$EVIDENCE_DIR/coverage-jdk17.json"
+          python - "$EVIDENCE_DIR" <<'PY' | tee "$EVIDENCE_DIR/java-runtime-proof.json"
+          import json
+          import sys
+          import xml.etree.ElementTree as ET
+          from pathlib import Path
+          root = Path(sys.argv[1])
+          expected = {
+              "com.github.copilot.decisions.DecisionsTest": 205,
+              "com.github.copilot.DecisionsSessionAccessorTest": 3,
+          }
+          evidence = {}
+          for version in (25, 17):
+              reports = sorted((root / f"reports-jdk{version}").glob("TEST-*.xml"))
+              if len(reports) != len(expected):
+                  raise SystemExit(f"Missing or unexpected Java {version} reports")
+              seen = {}
+              for path in reports:
+                  suite = ET.parse(path).getroot()
+                  name = suite.get("name")
+                  cases = suite.findall("testcase")
+                  props = {p.get("name"): p.get("value") for p in suite.findall("./properties/property")}
+                  if (
+                      name not in expected or name in seen
+                      or int(suite.get("tests", "-1")) != expected[name]
+                      or len(cases) != expected[name]
+                      or props.get("java.specification.version") != str(version)
+                      or any(int(suite.get(k, "-1")) != 0 for k in ("failures", "errors", "skipped"))
+                      or any(
+                          case.get("classname") != name
+                          or any(case.find(tag) is not None for tag in (
+                              "failure", "error", "skipped", "flakyFailure", "flakyError",
+                              "rerunFailure", "rerunError",
+                          ))
+                          for case in cases
+                      )
+                  ):
+                      raise SystemExit(f"Invalid or unsuccessful Java {version} report: {path.name}")
+                  seen[name] = {"tests": len(cases), "javaVersion": props.get("java.version")}
+              if set(seen) != set(expected):
+                  raise SystemExit(f"Incomplete Java {version} suite")
+              evidence[str(version)] = seen
+          print(json.dumps({"status": "passed", "runtimes": evidence}, indent=2))
+          PY
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         if: always()
         with:
@@ -377,7 +446,8 @@ jobs:
     env:
       CARGO_BUILD_JOBS: "2"
       RUST_TEST_THREADS: "2"
-      EVIDENCE_DIR: ${{ github.workspace }}/../decisions-rust-primary
+      OPENSSL_STATIC: "0"
+      EVIDENCE_DIR: ${{ github.workspace }}-decisions-rust-primary
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
         with:

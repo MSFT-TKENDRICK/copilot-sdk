@@ -105,12 +105,14 @@ cancelled-RPC guard. It does not substitute for the SDK suite or live calls.
 
 The [Decisions CI workflow](../../.github/workflows/decisions.yml) is an offline
 conformance workflow: it has no live provider secrets or model calls. It exercises
-the Node engine floor, supported Python minor versions, the Go version floor and
-Linux race detector, .NET target builds, Java packaging/style, and Rust's full
-offline library suite, selected shared-JSON integrations and default-feature
-compilation. It also exercises Python's built wheel. Its complete-census job
-depends on every SDK job succeeding. Defining this workflow does not mean its
-first clean-run results have passed.
+the Node engine floor and packaged ESM/CommonJS consumers, supported Python minor
+versions, the Go version floor and Linux race detector, .NET target builds, Java
+25 packaging/style and the same Decisions suite on Java 17, and Rust's full offline
+library suite, selected shared-JSON integrations and default-feature compilation.
+The Java runtime check verifies fresh test reports identify the intended JVM;
+Java 17-compatible bytecode alone is not execution evidence. The workflow also
+exercises Python's built wheel. Its complete-census job depends on every SDK job
+succeeding. Defining this workflow does not mean its clean-run results have passed.
 
 Offline conformance, real-CLI/local-provider integration, SDK mutation testing,
 and live OpenAI/Azure execution are distinct gates. A scoring-harness mutation
